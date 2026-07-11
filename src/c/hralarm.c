@@ -27,7 +27,10 @@ static Window *s_alarm_window;
 static TextLayer *s_alarm_bpm_layer;
 static TextLayer *s_alarm_status_layer;
 static TextLayer *s_alarm_progress_layer;
-static TextLayer *s_alarm_debug_layer;
+static Layer *s_alarm_progress_bar_layer;
+
+static float s_progress_fraction = 0.f;
+static GColor s_progress_color;
 
 static int s_target_bpm = DEFAULT_TARGET_BPM;
 static int s_sustain_secs = DEFAULT_SUSTAIN_SECS;
@@ -98,14 +101,68 @@ static void start_hr_alarm_siren(void) {
     { .midi_note = 91, .waveform = SpeakerWaveformSquare, .duration_ms = 250, .velocity = 127 },
     { .midi_note = 86, .waveform = SpeakerWaveformSquare, .duration_ms = 250, .velocity = 127 },
   };
-  bool started = speaker_play_notes(notes, ARRAY_LENGTH(notes), ALARM_VOLUME);
-  bool muted = speaker_is_muted();
-  SpeakerStatus status = speaker_get_status();
-  APP_LOG(APP_LOG_LEVEL_DEBUG, "siren: started=%d muted=%d status=%d", started, muted, status);
+  speaker_play_notes(notes, ARRAY_LENGTH(notes), ALARM_VOLUME);
+}
 
-  static char debug_buf[40];
-  snprintf(debug_buf, sizeof(debug_buf), "snd:%d muted:%d st:%d", started, muted, status);
-  text_layer_set_text(s_alarm_debug_layer, debug_buf);
+static void progress_bar_draw_proc(Layer *layer, GContext *ctx) {
+  GRect bounds = layer_get_bounds(layer);
+
+  graphics_context_set_stroke_color(ctx, PBL_IF_COLOR_ELSE(GColorWhite, GColorBlack));
+  graphics_context_set_stroke_width(ctx, 2);
+  graphics_draw_round_rect(ctx, bounds, 6);
+
+  GRect fill = GRect(bounds.origin.x + 3, bounds.origin.y + 3,
+                      (int16_t)((bounds.size.w - 6) * s_progress_fraction), bounds.size.h - 6);
+  if (fill.size.w > 0) {
+    graphics_context_set_fill_color(ctx, s_progress_color);
+    graphics_fill_rect(ctx, fill, 4, GCornersAll);
+  }
+}
+
+// applies the background/text colors and progress bar for the current
+// phase/state, so the whole screen communicates urgency at a glance
+static void apply_alarm_theme(int bpm) {
+  GColor bg, fg;
+
+  if (s_unlocked) {
+    bg = PBL_IF_COLOR_ELSE(GColorGreen, GColorWhite);
+    fg = GColorBlack;
+    s_progress_color = GColorBlack;
+    s_progress_fraction = 1.f;
+  } else if (s_phase == AlarmPhaseGrace) {
+    bg = PBL_IF_COLOR_ELSE(GColorOrange, GColorWhite);
+    fg = GColorBlack;
+    s_progress_color = GColorBlack;
+    s_progress_fraction = (float)s_grace_elapsed_secs / GRACE_SECS;
+  } else if (s_phase == AlarmPhaseCalibrating) {
+    bg = PBL_IF_COLOR_ELSE(GColorVividCerulean, GColorWhite);
+    fg = GColorBlack;
+    s_progress_color = GColorBlack;
+    s_progress_fraction = (float)s_calibration_elapsed_secs / s_calibration_min_secs;
+  } else {
+    // active phase: red while below threshold (flashing for urgency),
+    // shifting toward green as sustain progress builds
+    bool below = bpm < s_target_bpm;
+    if (below) {
+      bool flash_on = (s_elapsed_seconds % 2) == 0;
+      bg = PBL_IF_COLOR_ELSE(flash_on ? GColorRed : GColorDarkCandyAppleRed,
+                              flash_on ? GColorWhite : GColorBlack);
+      fg = flash_on ? GColorWhite : PBL_IF_COLOR_ELSE(GColorWhite, GColorBlack);
+    } else {
+      bg = PBL_IF_COLOR_ELSE(GColorChromeYellow, GColorWhite);
+      fg = GColorBlack;
+    }
+    s_progress_color = PBL_IF_COLOR_ELSE(GColorIslamicGreen, GColorBlack);
+    s_progress_fraction = s_sustain_secs > 0 ? (float)s_sustained_seconds / s_sustain_secs : 0.f;
+  }
+
+  window_set_background_color(s_alarm_window, bg);
+  text_layer_set_text_color(s_alarm_bpm_layer, fg);
+  text_layer_set_text_color(s_alarm_status_layer, fg);
+  text_layer_set_text_color(s_alarm_progress_layer, fg);
+  if (s_alarm_progress_bar_layer) {
+    layer_mark_dirty(s_alarm_progress_bar_layer);
+  }
 }
 
 static void update_alarm_ui(int bpm) {
@@ -124,10 +181,10 @@ static void update_alarm_ui(int bpm) {
   text_layer_set_text(s_alarm_bpm_layer, bpm_buf);
 
   if (s_unlocked) {
-    snprintf(status_buf, sizeof(status_buf), "Unlocked!\nPress SELECT to stop");
-    snprintf(progress_buf, sizeof(progress_buf), "%d/%d s", s_sustain_secs, s_sustain_secs);
+    snprintf(status_buf, sizeof(status_buf), "UNLOCKED");
+    snprintf(progress_buf, sizeof(progress_buf), "press SELECT to stop");
   } else if (s_phase == AlarmPhaseGrace) {
-    snprintf(status_buf, sizeof(status_buf), "Wake up!");
+    snprintf(status_buf, sizeof(status_buf), "WAKE UP");
     snprintf(progress_buf, sizeof(progress_buf), "%d/%d s", s_grace_elapsed_secs, GRACE_SECS);
   } else if (s_phase == AlarmPhaseCalibrating) {
     snprintf(status_buf, sizeof(status_buf), "Calibrating...");
@@ -144,6 +201,8 @@ static void update_alarm_ui(int bpm) {
   }
   text_layer_set_text(s_alarm_status_layer, status_buf);
   text_layer_set_text(s_alarm_progress_layer, progress_buf);
+
+  apply_alarm_theme(bpm);
 }
 
 static void alarm_tick(void *data) {
@@ -227,26 +286,29 @@ static void alarm_click_config_provider(void *context) {
 static void alarm_window_load(Window *window) {
   Layer *window_layer = window_get_root_layer(window);
   GRect bounds = layer_get_bounds(window_layer);
+  int16_t h = bounds.size.h;
 
-  s_alarm_bpm_layer = text_layer_create(GRect(0, 20, bounds.size.w, 50));
+  s_alarm_bpm_layer = text_layer_create(GRect(0, h / 10, bounds.size.w, h / 4));
+  text_layer_set_background_color(s_alarm_bpm_layer, GColorClear);
   text_layer_set_font(s_alarm_bpm_layer, fonts_get_system_font(FONT_KEY_BITHAM_42_BOLD));
   text_layer_set_text_alignment(s_alarm_bpm_layer, GTextAlignmentCenter);
   layer_add_child(window_layer, text_layer_get_layer(s_alarm_bpm_layer));
 
-  s_alarm_status_layer = text_layer_create(GRect(0, 75, bounds.size.w, 60));
+  s_alarm_status_layer = text_layer_create(GRect(0, h * 38 / 100, bounds.size.w, h / 4));
+  text_layer_set_background_color(s_alarm_status_layer, GColorClear);
   text_layer_set_font(s_alarm_status_layer, fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD));
   text_layer_set_text_alignment(s_alarm_status_layer, GTextAlignmentCenter);
   layer_add_child(window_layer, text_layer_get_layer(s_alarm_status_layer));
 
-  s_alarm_progress_layer = text_layer_create(GRect(0, 140, bounds.size.w, 30));
+  s_alarm_progress_bar_layer = layer_create(GRect(20, h * 66 / 100, bounds.size.w - 40, 18));
+  layer_set_update_proc(s_alarm_progress_bar_layer, progress_bar_draw_proc);
+  layer_add_child(window_layer, s_alarm_progress_bar_layer);
+
+  s_alarm_progress_layer = text_layer_create(GRect(0, h * 66 / 100 + 24, bounds.size.w, 24));
+  text_layer_set_background_color(s_alarm_progress_layer, GColorClear);
   text_layer_set_font(s_alarm_progress_layer, fonts_get_system_font(FONT_KEY_GOTHIC_18));
   text_layer_set_text_alignment(s_alarm_progress_layer, GTextAlignmentCenter);
   layer_add_child(window_layer, text_layer_get_layer(s_alarm_progress_layer));
-
-  s_alarm_debug_layer = text_layer_create(GRect(0, 170, bounds.size.w, 20));
-  text_layer_set_font(s_alarm_debug_layer, fonts_get_system_font(FONT_KEY_GOTHIC_14));
-  text_layer_set_text_alignment(s_alarm_debug_layer, GTextAlignmentCenter);
-  layer_add_child(window_layer, text_layer_get_layer(s_alarm_debug_layer));
 
   vibes_cancel();
   speaker_stop();
@@ -268,7 +330,7 @@ static void alarm_window_unload(Window *window) {
   vibes_cancel();
   speaker_stop();
   s_alarm_active = false;
-  text_layer_destroy(s_alarm_debug_layer);
+  layer_destroy(s_alarm_progress_bar_layer);
   text_layer_destroy(s_alarm_bpm_layer);
   text_layer_destroy(s_alarm_status_layer);
   text_layer_destroy(s_alarm_progress_layer);
@@ -391,21 +453,40 @@ static void main_click_config_provider(void *context) {
   window_long_click_subscribe(BUTTON_ID_SELECT, 700, select_long_click_handler, NULL);
 }
 
+static void accent_bar_draw_proc(Layer *layer, GContext *ctx) {
+  graphics_context_set_fill_color(ctx, PBL_IF_COLOR_ELSE(GColorElectricBlue, GColorBlack));
+  graphics_fill_rect(ctx, layer_get_bounds(layer), 0, GCornerNone);
+}
+
+static Layer *s_accent_bar_layer;
+
 static void main_window_load(Window *window) {
   Layer *window_layer = window_get_root_layer(window);
   GRect bounds = layer_get_bounds(window_layer);
 
+  window_set_background_color(window, PBL_IF_COLOR_ELSE(GColorOxfordBlue, GColorWhite));
+
   s_time_layer = text_layer_create(GRect(0, 15, bounds.size.w, 50));
+  text_layer_set_background_color(s_time_layer, GColorClear);
+  text_layer_set_text_color(s_time_layer, PBL_IF_COLOR_ELSE(GColorWhite, GColorBlack));
   text_layer_set_font(s_time_layer, fonts_get_system_font(FONT_KEY_BITHAM_42_BOLD));
   text_layer_set_text_alignment(s_time_layer, GTextAlignmentCenter);
   layer_add_child(window_layer, text_layer_get_layer(s_time_layer));
 
-  s_config_layer = text_layer_create(GRect(0, 70, bounds.size.w, 55));
+  s_accent_bar_layer = layer_create(GRect(bounds.size.w / 4, 62, bounds.size.w / 2, 3));
+  layer_set_update_proc(s_accent_bar_layer, accent_bar_draw_proc);
+  layer_add_child(window_layer, s_accent_bar_layer);
+
+  s_config_layer = text_layer_create(GRect(0, 72, bounds.size.w, 55));
+  text_layer_set_background_color(s_config_layer, GColorClear);
+  text_layer_set_text_color(s_config_layer, PBL_IF_COLOR_ELSE(GColorElectricBlue, GColorBlack));
   text_layer_set_font(s_config_layer, fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD));
   text_layer_set_text_alignment(s_config_layer, GTextAlignmentCenter);
   layer_add_child(window_layer, text_layer_get_layer(s_config_layer));
 
   s_hint_layer = text_layer_create(GRect(0, 130, bounds.size.w, 60));
+  text_layer_set_background_color(s_hint_layer, GColorClear);
+  text_layer_set_text_color(s_hint_layer, PBL_IF_COLOR_ELSE(GColorLightGray, GColorDarkGray));
   text_layer_set_font(s_hint_layer, fonts_get_system_font(FONT_KEY_GOTHIC_18));
   text_layer_set_text_alignment(s_hint_layer, GTextAlignmentCenter);
   layer_add_child(window_layer, text_layer_get_layer(s_hint_layer));
@@ -417,6 +498,7 @@ static void main_window_load(Window *window) {
 
 static void main_window_unload(Window *window) {
   text_layer_destroy(s_time_layer);
+  layer_destroy(s_accent_bar_layer);
   text_layer_destroy(s_config_layer);
   text_layer_destroy(s_hint_layer);
 }
