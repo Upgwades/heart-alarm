@@ -1,12 +1,13 @@
 #include <pebble.h>
 
 // --- config ---
-#define DEFAULT_TARGET_BPM 120
-#define DEFAULT_SUSTAIN_SECS 30
+#define DEFAULT_TARGET_BPM 100
+#define DEFAULT_SUSTAIN_SECS 10
 #define DEFAULT_DELAY_MINUTES 1
 #define HR_SAMPLE_PERIOD_SEC 1
 #define TICK_MS 1000
 #define WAKEUP_REASON_ALARM 0
+#define ALARM_VOLUME 100
 
 static Window *s_main_window;
 static TextLayer *s_time_layer;
@@ -44,12 +45,24 @@ static void save_settings(void) {
 
 // ---------- alarm window ----------
 static void start_hr_alarm_vibe(void) {
-  static const uint32_t segments[] = {200, 200, 200, 200, 200, 600};
+  // near-continuous hard buzzing: long pulses, almost no gap
+  static const uint32_t segments[] = {700, 50, 700, 50, 700, 50, 700, 50};
   VibePattern pattern = {
     .durations = segments,
     .num_segments = ARRAY_LENGTH(segments),
   };
   vibes_enqueue_custom_pattern(pattern);
+}
+
+static void start_hr_alarm_siren(void) {
+  // blaring two-tone siren, one cycle per tick (matches TICK_MS)
+  static const SpeakerNote notes[] = {
+    { .midi_note = 91, .waveform = SpeakerWaveformSquare, .duration_ms = 250, .velocity = 127 },
+    { .midi_note = 86, .waveform = SpeakerWaveformSquare, .duration_ms = 250, .velocity = 127 },
+    { .midi_note = 91, .waveform = SpeakerWaveformSquare, .duration_ms = 250, .velocity = 127 },
+    { .midi_note = 86, .waveform = SpeakerWaveformSquare, .duration_ms = 250, .velocity = 127 },
+  };
+  speaker_play_notes(notes, ARRAY_LENGTH(notes), ALARM_VOLUME);
 }
 
 static void update_alarm_ui(int bpm) {
@@ -82,10 +95,6 @@ static void update_alarm_ui(int bpm) {
 }
 
 static void alarm_tick(void *data) {
-  if (!s_unlocked) {
-    start_hr_alarm_vibe();
-  }
-
   HealthValue raw = health_service_peek_current_value(HealthMetricHeartRateRawBPM);
   int bpm = (int)raw;
 
@@ -98,6 +107,15 @@ static void alarm_tick(void *data) {
     } else {
       s_sustained_seconds = 0;
     }
+  }
+
+  // sound + vibration only run while HR is below the target threshold
+  bool below_threshold = !s_unlocked && bpm < s_target_bpm;
+  if (below_threshold) {
+    start_hr_alarm_vibe();
+    start_hr_alarm_siren();
+  } else {
+    speaker_stop();
   }
 
   update_alarm_ui(bpm);
@@ -114,6 +132,8 @@ static void alarm_select_click_handler(ClickRecognizerRef recognizer, void *cont
     app_timer_cancel(s_alarm_timer);
     s_alarm_timer = NULL;
   }
+  vibes_cancel();
+  speaker_stop();
   health_service_set_heart_rate_sample_period(0);
   window_stack_pop(true);
 }
@@ -150,6 +170,8 @@ static void alarm_window_load(Window *window) {
 }
 
 static void alarm_window_unload(Window *window) {
+  vibes_cancel();
+  speaker_stop();
   text_layer_destroy(s_alarm_bpm_layer);
   text_layer_destroy(s_alarm_status_layer);
   text_layer_destroy(s_alarm_progress_layer);
