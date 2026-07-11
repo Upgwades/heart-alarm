@@ -194,6 +194,16 @@ static void format_days_summary(uint8_t mask, char *buf, size_t n) {
 }
 
 // ---------- alarm window ----------
+static void start_grace_vibe(void) {
+  // stronger than a single short pulse: three firm buzzes back to back
+  static const uint32_t segments[] = {400, 100, 400, 100, 400};
+  VibePattern pattern = {
+    .durations = segments,
+    .num_segments = ARRAY_LENGTH(segments),
+  };
+  vibes_enqueue_custom_pattern(pattern);
+}
+
 static void start_hr_alarm_vibe(void) {
   // near-continuous hard buzzing: long pulses, almost no gap
   static const uint32_t segments[] = {700, 50, 700, 50, 700, 50, 700, 50};
@@ -296,19 +306,19 @@ static void update_alarm_ui(int bpm) {
     snprintf(progress_buf, sizeof(progress_buf), "press SELECT to stop");
   } else if (s_phase == AlarmPhaseGrace) {
     snprintf(status_buf, sizeof(status_buf), "WAKE UP");
-    snprintf(progress_buf, sizeof(progress_buf), "%d/%d s", s_grace_elapsed_secs, GRACE_SECS);
+    snprintf(progress_buf, sizeof(progress_buf), "%d/%d seconds", s_grace_elapsed_secs, GRACE_SECS);
   } else if (s_phase == AlarmPhaseCalibrating) {
     snprintf(status_buf, sizeof(status_buf), "Calibrating...");
-    snprintf(progress_buf, sizeof(progress_buf), "%d/%d s", s_calibration_elapsed_secs, s_calibration_min_secs);
+    snprintf(progress_buf, sizeof(progress_buf), "%d/%d seconds", s_calibration_elapsed_secs, s_calibration_min_secs);
   } else if (bpm <= 0) {
     snprintf(status_buf, sizeof(status_buf), "Measuring...");
     snprintf(progress_buf, sizeof(progress_buf), "target %d bpm", s_target_bpm);
   } else if (bpm >= s_target_bpm) {
     snprintf(status_buf, sizeof(status_buf), "Keep it up!");
-    snprintf(progress_buf, sizeof(progress_buf), "%d/%d s", s_sustained_seconds, s_sustain_secs);
+    snprintf(progress_buf, sizeof(progress_buf), "%d/%d seconds", s_sustained_seconds, s_sustain_secs);
   } else {
     snprintf(status_buf, sizeof(status_buf), "Get moving!\nneed %d bpm", s_target_bpm);
-    snprintf(progress_buf, sizeof(progress_buf), "%d/%d s", s_sustained_seconds, s_sustain_secs);
+    snprintf(progress_buf, sizeof(progress_buf), "%d/%d seconds", s_sustained_seconds, s_sustain_secs);
   }
   text_layer_set_text(s_alarm_status_layer, status_buf);
   text_layer_set_text(s_alarm_progress_layer, progress_buf);
@@ -322,7 +332,7 @@ static void alarm_tick(void *data) {
 
   if (s_phase == AlarmPhaseGrace) {
     if (s_grace_elapsed_secs % GRACE_BUZZ_INTERVAL_SECS == 0) {
-      vibes_short_pulse();
+      start_grace_vibe();
     }
     s_grace_elapsed_secs++;
     if (s_grace_elapsed_secs >= GRACE_SECS) {
@@ -468,8 +478,8 @@ static void enter_alarm_mode(void) {
 // ---------- HR settings window (shared across all alarms) ----------
 static void settings_update_text(void) {
   static char big[16];
-  static char summary[64];
-  static char hint[80];
+  static char summary[96];
+  static char hint[100];
 
   switch (s_active_field) {
     case FieldTargetBpm: snprintf(big, sizeof(big), "%d", s_target_bpm); break;
@@ -478,17 +488,17 @@ static void settings_update_text(void) {
   }
   text_layer_set_text(s_settings_big_layer, big);
 
-  snprintf(summary, sizeof(summary), "%d bpm / %ds sustain\ncalib min %ds",
+  snprintf(summary, sizeof(summary), "target %d bpm\nsustain %d seconds\ncalibration minimum %d seconds",
            s_target_bpm, s_sustain_secs, s_calibration_min_secs);
   text_layer_set_text(s_settings_summary_layer, summary);
 
   const char *field_name;
   switch (s_active_field) {
-    case FieldTargetBpm: field_name = "target bpm"; break;
-    case FieldSustainSecs: field_name = "sustain secs"; break;
-    default: field_name = "calib min secs"; break;
+    case FieldTargetBpm: field_name = "target heart rate"; break;
+    case FieldSustainSecs: field_name = "sustain duration"; break;
+    default: field_name = "calibration minimum"; break;
   }
-  snprintf(hint, sizeof(hint), "editing: %s\nUP/DOWN: change\nSELECT: next field", field_name);
+  snprintf(hint, sizeof(hint), "editing: %s\nUP/DOWN: change\nSELECT: next field\nhold SELECT: save & exit", field_name);
   text_layer_set_text(s_settings_hint_layer, hint);
 }
 
@@ -517,36 +527,44 @@ static void settings_select_click_handler(ClickRecognizerRef recognizer, void *c
   settings_update_text();
 }
 
+static void settings_select_long_click_handler(ClickRecognizerRef recognizer, void *context) {
+  // long-press SELECT: done editing, save and go back to the alarm list
+  save_settings();
+  window_stack_pop(true);
+}
+
 static void settings_click_config_provider(void *context) {
   window_single_click_subscribe(BUTTON_ID_UP, settings_up_click_handler);
   window_single_click_subscribe(BUTTON_ID_DOWN, settings_down_click_handler);
   window_single_click_subscribe(BUTTON_ID_SELECT, settings_select_click_handler);
+  window_long_click_subscribe(BUTTON_ID_SELECT, 700, settings_select_long_click_handler, NULL);
 }
 
 static void settings_window_load(Window *window) {
   Layer *window_layer = window_get_root_layer(window);
   GRect bounds = layer_get_bounds(window_layer);
+  int16_t h = bounds.size.h;
 
   window_set_background_color(window, PBL_IF_COLOR_ELSE(GColorOxfordBlue, GColorWhite));
 
-  s_settings_big_layer = text_layer_create(GRect(0, 20, bounds.size.w, 60));
+  s_settings_big_layer = text_layer_create(GRect(0, h * 8 / 100, bounds.size.w, h * 26 / 100));
   text_layer_set_background_color(s_settings_big_layer, GColorClear);
   text_layer_set_text_color(s_settings_big_layer, PBL_IF_COLOR_ELSE(GColorWhite, GColorBlack));
   text_layer_set_font(s_settings_big_layer, fonts_get_system_font(FONT_KEY_BITHAM_42_BOLD));
   text_layer_set_text_alignment(s_settings_big_layer, GTextAlignmentCenter);
   layer_add_child(window_layer, text_layer_get_layer(s_settings_big_layer));
 
-  s_settings_summary_layer = text_layer_create(GRect(0, 85, bounds.size.w, 50));
+  s_settings_summary_layer = text_layer_create(GRect(0, h * 36 / 100, bounds.size.w, h * 26 / 100));
   text_layer_set_background_color(s_settings_summary_layer, GColorClear);
   text_layer_set_text_color(s_settings_summary_layer, PBL_IF_COLOR_ELSE(GColorElectricBlue, GColorBlack));
   text_layer_set_font(s_settings_summary_layer, fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD));
   text_layer_set_text_alignment(s_settings_summary_layer, GTextAlignmentCenter);
   layer_add_child(window_layer, text_layer_get_layer(s_settings_summary_layer));
 
-  s_settings_hint_layer = text_layer_create(GRect(0, 140, bounds.size.w, 70));
+  s_settings_hint_layer = text_layer_create(GRect(0, h * 64 / 100, bounds.size.w, h * 36 / 100));
   text_layer_set_background_color(s_settings_hint_layer, GColorClear);
   text_layer_set_text_color(s_settings_hint_layer, PBL_IF_COLOR_ELSE(GColorLightGray, GColorDarkGray));
-  text_layer_set_font(s_settings_hint_layer, fonts_get_system_font(FONT_KEY_GOTHIC_18));
+  text_layer_set_font(s_settings_hint_layer, fonts_get_system_font(FONT_KEY_GOTHIC_14));
   text_layer_set_text_alignment(s_settings_hint_layer, GTextAlignmentCenter);
   layer_add_child(window_layer, text_layer_get_layer(s_settings_hint_layer));
 
@@ -575,7 +593,7 @@ static void edit_update_text(void) {
   Alarm *a = &s_alarms[s_editing_alarm_index];
   static char big[16];
   static char summary[64];
-  static char hint[80];
+  static char hint[100];
   static char days_buf[32];
 
   switch (s_edit_field) {
@@ -598,12 +616,12 @@ static void edit_update_text(void) {
 
   const char *field_name;
   switch (s_edit_field) {
-    case EFEnabled: field_name = "on/off"; break;
+    case EFEnabled: field_name = "on or off"; break;
     case EFHour: field_name = "hour"; break;
     case EFMinute: field_name = "minute"; break;
     default: field_name = "day toggle"; break;
   }
-  snprintf(hint, sizeof(hint), "editing: %s\nUP/DOWN: change\nSELECT: next field", field_name);
+  snprintf(hint, sizeof(hint), "editing: %s\nUP/DOWN: change\nSELECT: next field\nhold SELECT: save & exit", field_name);
   text_layer_set_text(s_edit_hint_layer, hint);
 }
 
@@ -640,36 +658,45 @@ static void edit_select_click_handler(ClickRecognizerRef recognizer, void *conte
   edit_update_text();
 }
 
+static void edit_select_long_click_handler(ClickRecognizerRef recognizer, void *context) {
+  // long-press SELECT: done editing this alarm, save and go back to the alarm list
+  save_alarms();
+  schedule_alarm_index(s_editing_alarm_index);
+  window_stack_pop(true);
+}
+
 static void edit_click_config_provider(void *context) {
   window_single_click_subscribe(BUTTON_ID_UP, edit_up_click_handler);
   window_single_click_subscribe(BUTTON_ID_DOWN, edit_down_click_handler);
   window_single_click_subscribe(BUTTON_ID_SELECT, edit_select_click_handler);
+  window_long_click_subscribe(BUTTON_ID_SELECT, 700, edit_select_long_click_handler, NULL);
 }
 
 static void edit_window_load(Window *window) {
   Layer *window_layer = window_get_root_layer(window);
   GRect bounds = layer_get_bounds(window_layer);
+  int16_t h = bounds.size.h;
 
   window_set_background_color(window, PBL_IF_COLOR_ELSE(GColorOxfordBlue, GColorWhite));
 
-  s_edit_big_layer = text_layer_create(GRect(0, 20, bounds.size.w, 60));
+  s_edit_big_layer = text_layer_create(GRect(0, h * 8 / 100, bounds.size.w, h * 26 / 100));
   text_layer_set_background_color(s_edit_big_layer, GColorClear);
   text_layer_set_text_color(s_edit_big_layer, PBL_IF_COLOR_ELSE(GColorWhite, GColorBlack));
   text_layer_set_font(s_edit_big_layer, fonts_get_system_font(FONT_KEY_BITHAM_42_BOLD));
   text_layer_set_text_alignment(s_edit_big_layer, GTextAlignmentCenter);
   layer_add_child(window_layer, text_layer_get_layer(s_edit_big_layer));
 
-  s_edit_summary_layer = text_layer_create(GRect(0, 85, bounds.size.w, 50));
+  s_edit_summary_layer = text_layer_create(GRect(0, h * 36 / 100, bounds.size.w, h * 26 / 100));
   text_layer_set_background_color(s_edit_summary_layer, GColorClear);
   text_layer_set_text_color(s_edit_summary_layer, PBL_IF_COLOR_ELSE(GColorElectricBlue, GColorBlack));
   text_layer_set_font(s_edit_summary_layer, fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD));
   text_layer_set_text_alignment(s_edit_summary_layer, GTextAlignmentCenter);
   layer_add_child(window_layer, text_layer_get_layer(s_edit_summary_layer));
 
-  s_edit_hint_layer = text_layer_create(GRect(0, 140, bounds.size.w, 70));
+  s_edit_hint_layer = text_layer_create(GRect(0, h * 64 / 100, bounds.size.w, h * 36 / 100));
   text_layer_set_background_color(s_edit_hint_layer, GColorClear);
   text_layer_set_text_color(s_edit_hint_layer, PBL_IF_COLOR_ELSE(GColorLightGray, GColorDarkGray));
-  text_layer_set_font(s_edit_hint_layer, fonts_get_system_font(FONT_KEY_GOTHIC_18));
+  text_layer_set_font(s_edit_hint_layer, fonts_get_system_font(FONT_KEY_GOTHIC_14));
   text_layer_set_text_alignment(s_edit_hint_layer, GTextAlignmentCenter);
   layer_add_child(window_layer, text_layer_get_layer(s_edit_hint_layer));
 
@@ -809,6 +836,13 @@ static void list_window_unload(Window *window) {
   text_layer_destroy(s_list_hint_layer);
 }
 
+static void list_window_appear(Window *window) {
+  // refresh immediately when returning from the edit/settings screens,
+  // rather than waiting for the next UP/DOWN press
+  list_update_title();
+  list_update_text();
+}
+
 static void wakeup_handler(WakeupId id, int32_t reason) {
   s_active_alarm_index = (int)reason;
   enter_alarm_mode();
@@ -823,6 +857,7 @@ static void init(void) {
   window_set_window_handlers(s_list_window, (WindowHandlers) {
     .load = list_window_load,
     .unload = list_window_unload,
+    .appear = list_window_appear,
   });
   window_stack_push(s_list_window, true);
 
