@@ -1,0 +1,27 @@
+{
+  "name": "hralarm",
+  "author": "MakeAwesomeHappen",
+  "version": "1.0.0",
+  "keywords": ["pebble-app"],
+  "private": true,
+  "dependencies": {},
+  "pebble": {
+    "displayName": "HR Alarm",
+    "uuid": "9bf6af76-f3bb-4f15-952b-6a9bed8ff45b",
+    "sdkVersion": "3",
+    "enableMultiJS": true,
+    "targetPlatforms": [
+      "diorite",
+      "flint"
+    ],
+    "capabilities": [
+      "health"
+    ],
+    "watchapp": {
+      "watchface": false
+    },
+    "resources": {
+      "media": []
+    }
+  }
+}
