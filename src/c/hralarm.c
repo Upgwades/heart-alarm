@@ -8,9 +8,6 @@
 #define TICK_MS 1000
 #define WAKEUP_REASON_ALARM 0
 #define ALARM_VOLUME 100
-// sensor still reports the stale pre-alarm reading for a few seconds after
-// it starts sampling again; ignore readings until this many seconds have passed
-#define CALIBRATION_SECS 8
 
 static Window *s_main_window;
 static TextLayer *s_time_layer;
@@ -32,6 +29,18 @@ static int s_elapsed_seconds = 0;
 static bool s_unlocked = false;
 static AppTimer *s_alarm_timer;
 static WakeupId s_wakeup_id;
+
+// gates on an actual HealthEventHeartRateUpdate rather than a fixed delay,
+// since peek_current_value can keep returning a stale pre-alarm reading
+// for an unpredictable amount of time until the sensor produces a real sample
+static bool s_alarm_active = false;
+static int s_fresh_hr_events = 0;
+
+static void health_event_handler(HealthEventType event, void *context) {
+  if (s_alarm_active && event == HealthEventHeartRateUpdate) {
+    s_fresh_hr_events++;
+  }
+}
 
 // ---------- persistence ----------
 enum { PKEY_TARGET_BPM = 100, PKEY_SUSTAIN_SECS = 101, PKEY_DELAY_MIN = 102, PKEY_WAKEUP_ID = 103 };
@@ -82,7 +91,9 @@ static void update_alarm_ui(int bpm) {
   static char status_buf[48];
   static char progress_buf[24];
 
-  if (bpm <= 0) {
+  if (bpm <= 0 || s_fresh_hr_events < 1) {
+    // don't show a number until it's confirmed fresh, to avoid displaying
+    // a stale reading left over from before the alarm started
     snprintf(bpm_buf, sizeof(bpm_buf), "-- BPM");
   } else {
     snprintf(bpm_buf, sizeof(bpm_buf), "%d BPM", bpm);
@@ -92,9 +103,9 @@ static void update_alarm_ui(int bpm) {
   if (s_unlocked) {
     snprintf(status_buf, sizeof(status_buf), "Unlocked!\nPress SELECT to stop");
     snprintf(progress_buf, sizeof(progress_buf), "%d/%d s", s_sustain_secs, s_sustain_secs);
-  } else if (s_elapsed_seconds < CALIBRATION_SECS) {
+  } else if (s_fresh_hr_events < 1) {
     snprintf(status_buf, sizeof(status_buf), "Calibrating...");
-    snprintf(progress_buf, sizeof(progress_buf), "%d/%d s", s_elapsed_seconds, CALIBRATION_SECS);
+    snprintf(progress_buf, sizeof(progress_buf), "waiting %ds", s_elapsed_seconds);
   } else if (bpm <= 0) {
     snprintf(status_buf, sizeof(status_buf), "Measuring...");
     snprintf(progress_buf, sizeof(progress_buf), "target %d bpm", s_target_bpm);
@@ -112,7 +123,7 @@ static void update_alarm_ui(int bpm) {
 static void alarm_tick(void *data) {
   HealthValue raw = health_service_peek_current_value(HealthMetricHeartRateRawBPM);
   int bpm = (int)raw;
-  bool calibrating = s_elapsed_seconds < CALIBRATION_SECS;
+  bool calibrating = s_fresh_hr_events < 1;
 
   if (!s_unlocked && !calibrating) {
     if (bpm >= s_target_bpm) {
@@ -153,6 +164,7 @@ static void alarm_select_click_handler(ClickRecognizerRef recognizer, void *cont
   }
   vibes_cancel();
   speaker_stop();
+  s_alarm_active = false;
   health_service_set_heart_rate_sample_period(0);
   window_stack_pop(true);
 }
@@ -190,6 +202,8 @@ static void alarm_window_load(Window *window) {
   health_service_set_heart_rate_sample_period(HR_SAMPLE_PERIOD_SEC);
   s_sustained_seconds = 0;
   s_elapsed_seconds = 0;
+  s_fresh_hr_events = 0;
+  s_alarm_active = true;
   s_unlocked = false;
   update_alarm_ui(0);
 
@@ -199,6 +213,7 @@ static void alarm_window_load(Window *window) {
 static void alarm_window_unload(Window *window) {
   vibes_cancel();
   speaker_stop();
+  s_alarm_active = false;
   text_layer_destroy(s_alarm_debug_layer);
   text_layer_destroy(s_alarm_bpm_layer);
   text_layer_destroy(s_alarm_status_layer);
@@ -318,6 +333,7 @@ static void init(void) {
 
   tick_timer_service_subscribe(MINUTE_UNIT, tick_handler);
   wakeup_service_subscribe(wakeup_handler);
+  health_service_events_subscribe(health_event_handler, NULL);
 
   if (launch_reason() == APP_LAUNCH_WAKEUP) {
     WakeupId id = 0;
