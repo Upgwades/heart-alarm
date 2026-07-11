@@ -8,6 +8,9 @@
 #define TICK_MS 1000
 #define WAKEUP_REASON_ALARM 0
 #define ALARM_VOLUME 100
+// sensor still reports the stale pre-alarm reading for a few seconds after
+// it starts sampling again; ignore readings until this many seconds have passed
+#define CALIBRATION_SECS 8
 
 static Window *s_main_window;
 static TextLayer *s_time_layer;
@@ -25,6 +28,7 @@ static int s_sustain_secs = DEFAULT_SUSTAIN_SECS;
 static int s_delay_minutes = DEFAULT_DELAY_MINUTES;
 
 static int s_sustained_seconds = 0;
+static int s_elapsed_seconds = 0;
 static bool s_unlocked = false;
 static AppTimer *s_alarm_timer;
 static WakeupId s_wakeup_id;
@@ -88,6 +92,9 @@ static void update_alarm_ui(int bpm) {
   if (s_unlocked) {
     snprintf(status_buf, sizeof(status_buf), "Unlocked!\nPress SELECT to stop");
     snprintf(progress_buf, sizeof(progress_buf), "%d/%d s", s_sustain_secs, s_sustain_secs);
+  } else if (s_elapsed_seconds < CALIBRATION_SECS) {
+    snprintf(status_buf, sizeof(status_buf), "Calibrating...");
+    snprintf(progress_buf, sizeof(progress_buf), "%d/%d s", s_elapsed_seconds, CALIBRATION_SECS);
   } else if (bpm <= 0) {
     snprintf(status_buf, sizeof(status_buf), "Measuring...");
     snprintf(progress_buf, sizeof(progress_buf), "target %d bpm", s_target_bpm);
@@ -105,8 +112,9 @@ static void update_alarm_ui(int bpm) {
 static void alarm_tick(void *data) {
   HealthValue raw = health_service_peek_current_value(HealthMetricHeartRateRawBPM);
   int bpm = (int)raw;
+  bool calibrating = s_elapsed_seconds < CALIBRATION_SECS;
 
-  if (!s_unlocked) {
+  if (!s_unlocked && !calibrating) {
     if (bpm >= s_target_bpm) {
       s_sustained_seconds++;
       if (s_sustained_seconds >= s_sustain_secs) {
@@ -116,9 +124,11 @@ static void alarm_tick(void *data) {
       s_sustained_seconds = 0;
     }
   }
+  s_elapsed_seconds++;
 
   // sound + vibration only run while HR is below the target threshold
-  bool below_threshold = !s_unlocked && bpm < s_target_bpm;
+  // (during calibration, the reading isn't trustworthy yet, so keep alarming)
+  bool below_threshold = !s_unlocked && (calibrating || bpm < s_target_bpm);
   if (below_threshold) {
     start_hr_alarm_vibe();
     start_hr_alarm_siren();
@@ -176,6 +186,7 @@ static void alarm_window_load(Window *window) {
 
   health_service_set_heart_rate_sample_period(HR_SAMPLE_PERIOD_SEC);
   s_sustained_seconds = 0;
+  s_elapsed_seconds = 0;
   s_unlocked = false;
   update_alarm_ui(0);
 
