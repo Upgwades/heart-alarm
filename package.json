@@ -12,7 +12,7 @@
     "enableMultiJS": true,
     "targetPlatforms": [
       "diorite",
-      "flint"
+      "emery"
     ],
     "capabilities": [
       "health"

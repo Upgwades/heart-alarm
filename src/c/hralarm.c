@@ -18,6 +18,7 @@ static Window *s_alarm_window;
 static TextLayer *s_alarm_bpm_layer;
 static TextLayer *s_alarm_status_layer;
 static TextLayer *s_alarm_progress_layer;
+static TextLayer *s_alarm_debug_layer;
 
 static int s_target_bpm = DEFAULT_TARGET_BPM;
 static int s_sustain_secs = DEFAULT_SUSTAIN_SECS;
@@ -62,7 +63,14 @@ static void start_hr_alarm_siren(void) {
     { .midi_note = 91, .waveform = SpeakerWaveformSquare, .duration_ms = 250, .velocity = 127 },
     { .midi_note = 86, .waveform = SpeakerWaveformSquare, .duration_ms = 250, .velocity = 127 },
   };
-  speaker_play_notes(notes, ARRAY_LENGTH(notes), ALARM_VOLUME);
+  bool started = speaker_play_notes(notes, ARRAY_LENGTH(notes), ALARM_VOLUME);
+  bool muted = speaker_is_muted();
+  SpeakerStatus status = speaker_get_status();
+  APP_LOG(APP_LOG_LEVEL_DEBUG, "siren: started=%d muted=%d status=%d", started, muted, status);
+
+  static char debug_buf[40];
+  snprintf(debug_buf, sizeof(debug_buf), "snd:%d muted:%d st:%d", started, muted, status);
+  text_layer_set_text(s_alarm_debug_layer, debug_buf);
 }
 
 static void update_alarm_ui(int bpm) {
@@ -161,6 +169,11 @@ static void alarm_window_load(Window *window) {
   text_layer_set_text_alignment(s_alarm_progress_layer, GTextAlignmentCenter);
   layer_add_child(window_layer, text_layer_get_layer(s_alarm_progress_layer));
 
+  s_alarm_debug_layer = text_layer_create(GRect(0, 170, bounds.size.w, 20));
+  text_layer_set_font(s_alarm_debug_layer, fonts_get_system_font(FONT_KEY_GOTHIC_14));
+  text_layer_set_text_alignment(s_alarm_debug_layer, GTextAlignmentCenter);
+  layer_add_child(window_layer, text_layer_get_layer(s_alarm_debug_layer));
+
   health_service_set_heart_rate_sample_period(HR_SAMPLE_PERIOD_SEC);
   s_sustained_seconds = 0;
   s_unlocked = false;
@@ -172,6 +185,7 @@ static void alarm_window_load(Window *window) {
 static void alarm_window_unload(Window *window) {
   vibes_cancel();
   speaker_stop();
+  text_layer_destroy(s_alarm_debug_layer);
   text_layer_destroy(s_alarm_bpm_layer);
   text_layer_destroy(s_alarm_status_layer);
   text_layer_destroy(s_alarm_progress_layer);
