@@ -5,7 +5,8 @@
 #define DEFAULT_SUSTAIN_SECS 10
 #define DEFAULT_DELAY_MINUTES 1
 #define DEFAULT_CALIBRATION_MIN_SECS 5
-#define GRACE_BUZZ_COUNT 3
+#define GRACE_SECS 20               // testing default; bumped up from a few seconds
+#define GRACE_BUZZ_INTERVAL_SECS 4  // buzz every N seconds during grace, not every tick
 #define HR_SAMPLE_PERIOD_SEC 1
 #define TICK_MS 1000
 #define WAKEUP_REASON_ALARM 0
@@ -40,7 +41,7 @@ static AppTimer *s_alarm_timer;
 static WakeupId s_wakeup_id;
 
 static AlarmPhase s_phase = AlarmPhaseGrace;
-static int s_grace_buzzes_done = 0;
+static int s_grace_elapsed_secs = 0;
 static int s_calibration_elapsed_secs = 0;
 
 // gates on an actual HealthEventHeartRateUpdate rather than a fixed delay,
@@ -127,7 +128,7 @@ static void update_alarm_ui(int bpm) {
     snprintf(progress_buf, sizeof(progress_buf), "%d/%d s", s_sustain_secs, s_sustain_secs);
   } else if (s_phase == AlarmPhaseGrace) {
     snprintf(status_buf, sizeof(status_buf), "Wake up!");
-    snprintf(progress_buf, sizeof(progress_buf), "%d/%d", s_grace_buzzes_done, GRACE_BUZZ_COUNT);
+    snprintf(progress_buf, sizeof(progress_buf), "%d/%d s", s_grace_elapsed_secs, GRACE_SECS);
   } else if (s_phase == AlarmPhaseCalibrating) {
     snprintf(status_buf, sizeof(status_buf), "Calibrating...");
     snprintf(progress_buf, sizeof(progress_buf), "%d/%d s", s_calibration_elapsed_secs, s_calibration_min_secs);
@@ -150,9 +151,11 @@ static void alarm_tick(void *data) {
   int bpm = (int)raw;
 
   if (s_phase == AlarmPhaseGrace) {
-    vibes_short_pulse();
-    s_grace_buzzes_done++;
-    if (s_grace_buzzes_done >= GRACE_BUZZ_COUNT) {
+    if (s_grace_elapsed_secs % GRACE_BUZZ_INTERVAL_SECS == 0) {
+      vibes_short_pulse();
+    }
+    s_grace_elapsed_secs++;
+    if (s_grace_elapsed_secs >= GRACE_SECS) {
       s_phase = AlarmPhaseCalibrating;
       s_calibration_elapsed_secs = 0;
     }
@@ -254,7 +257,7 @@ static void alarm_window_load(Window *window) {
   s_alarm_active = true;
   s_unlocked = false;
   s_phase = AlarmPhaseGrace;
-  s_grace_buzzes_done = 0;
+  s_grace_elapsed_secs = 0;
   s_calibration_elapsed_secs = 0;
   update_alarm_ui(0);
 
