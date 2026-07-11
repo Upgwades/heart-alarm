@@ -204,6 +204,16 @@ static void start_grace_vibe(void) {
   vibes_enqueue_custom_pattern(pattern);
 }
 
+static void start_success_vibe(void) {
+  // short celebratory triple-tap, distinct from the urgent alarm buzz
+  static const uint32_t segments[] = {100, 80, 100, 80, 200};
+  VibePattern pattern = {
+    .durations = segments,
+    .num_segments = ARRAY_LENGTH(segments),
+  };
+  vibes_enqueue_custom_pattern(pattern);
+}
+
 static void start_hr_alarm_vibe(void) {
   // near-continuous hard buzzing: long pulses, almost no gap
   static const uint32_t segments[] = {700, 50, 700, 50, 700, 50, 700, 50};
@@ -361,6 +371,7 @@ static void alarm_tick(void *data) {
       s_sustained_seconds++;
       if (s_sustained_seconds >= s_sustain_secs) {
         s_unlocked = true;
+        start_success_vibe();
       }
     } else {
       s_sustained_seconds = 0;
