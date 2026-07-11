@@ -4,10 +4,18 @@
 #define DEFAULT_TARGET_BPM 100
 #define DEFAULT_SUSTAIN_SECS 10
 #define DEFAULT_DELAY_MINUTES 1
+#define DEFAULT_CALIBRATION_MIN_SECS 5
+#define GRACE_BUZZ_COUNT 3
 #define HR_SAMPLE_PERIOD_SEC 1
 #define TICK_MS 1000
 #define WAKEUP_REASON_ALARM 0
 #define ALARM_VOLUME 100
+
+typedef enum {
+  AlarmPhaseGrace,        // a few buzzes to rouse the wearer before we start reading HR
+  AlarmPhaseCalibrating,  // waiting for a fresh HR sample + minimum settle time
+  AlarmPhaseActive,       // normal threshold/sustain logic
+} AlarmPhase;
 
 static Window *s_main_window;
 static TextLayer *s_time_layer;
@@ -23,12 +31,17 @@ static TextLayer *s_alarm_debug_layer;
 static int s_target_bpm = DEFAULT_TARGET_BPM;
 static int s_sustain_secs = DEFAULT_SUSTAIN_SECS;
 static int s_delay_minutes = DEFAULT_DELAY_MINUTES;
+static int s_calibration_min_secs = DEFAULT_CALIBRATION_MIN_SECS;
 
 static int s_sustained_seconds = 0;
 static int s_elapsed_seconds = 0;
 static bool s_unlocked = false;
 static AppTimer *s_alarm_timer;
 static WakeupId s_wakeup_id;
+
+static AlarmPhase s_phase = AlarmPhaseGrace;
+static int s_grace_buzzes_done = 0;
+static int s_calibration_elapsed_secs = 0;
 
 // gates on an actual HealthEventHeartRateUpdate rather than a fixed delay,
 // since peek_current_value can keep returning a stale pre-alarm reading
@@ -43,18 +56,26 @@ static void health_event_handler(HealthEventType event, void *context) {
 }
 
 // ---------- persistence ----------
-enum { PKEY_TARGET_BPM = 100, PKEY_SUSTAIN_SECS = 101, PKEY_DELAY_MIN = 102, PKEY_WAKEUP_ID = 103 };
+enum {
+  PKEY_TARGET_BPM = 100,
+  PKEY_SUSTAIN_SECS = 101,
+  PKEY_DELAY_MIN = 102,
+  PKEY_WAKEUP_ID = 103,
+  PKEY_CALIBRATION_MIN_SECS = 104,
+};
 
 static void load_settings(void) {
   if (persist_exists(PKEY_TARGET_BPM)) s_target_bpm = persist_read_int(PKEY_TARGET_BPM);
   if (persist_exists(PKEY_SUSTAIN_SECS)) s_sustain_secs = persist_read_int(PKEY_SUSTAIN_SECS);
   if (persist_exists(PKEY_DELAY_MIN)) s_delay_minutes = persist_read_int(PKEY_DELAY_MIN);
+  if (persist_exists(PKEY_CALIBRATION_MIN_SECS)) s_calibration_min_secs = persist_read_int(PKEY_CALIBRATION_MIN_SECS);
 }
 
 static void save_settings(void) {
   persist_write_int(PKEY_TARGET_BPM, s_target_bpm);
   persist_write_int(PKEY_SUSTAIN_SECS, s_sustain_secs);
   persist_write_int(PKEY_DELAY_MIN, s_delay_minutes);
+  persist_write_int(PKEY_CALIBRATION_MIN_SECS, s_calibration_min_secs);
 }
 
 // ---------- alarm window ----------
@@ -91,7 +112,8 @@ static void update_alarm_ui(int bpm) {
   static char status_buf[48];
   static char progress_buf[24];
 
-  if (bpm <= 0 || s_fresh_hr_events < 1) {
+  bool reading_trustworthy = (s_phase == AlarmPhaseActive) || s_unlocked;
+  if (bpm <= 0 || !reading_trustworthy) {
     // don't show a number until it's confirmed fresh, to avoid displaying
     // a stale reading left over from before the alarm started
     snprintf(bpm_buf, sizeof(bpm_buf), "-- BPM");
@@ -103,9 +125,12 @@ static void update_alarm_ui(int bpm) {
   if (s_unlocked) {
     snprintf(status_buf, sizeof(status_buf), "Unlocked!\nPress SELECT to stop");
     snprintf(progress_buf, sizeof(progress_buf), "%d/%d s", s_sustain_secs, s_sustain_secs);
-  } else if (s_fresh_hr_events < 1) {
+  } else if (s_phase == AlarmPhaseGrace) {
+    snprintf(status_buf, sizeof(status_buf), "Wake up!");
+    snprintf(progress_buf, sizeof(progress_buf), "%d/%d", s_grace_buzzes_done, GRACE_BUZZ_COUNT);
+  } else if (s_phase == AlarmPhaseCalibrating) {
     snprintf(status_buf, sizeof(status_buf), "Calibrating...");
-    snprintf(progress_buf, sizeof(progress_buf), "waiting %ds", s_elapsed_seconds);
+    snprintf(progress_buf, sizeof(progress_buf), "%d/%d s", s_calibration_elapsed_secs, s_calibration_min_secs);
   } else if (bpm <= 0) {
     snprintf(status_buf, sizeof(status_buf), "Measuring...");
     snprintf(progress_buf, sizeof(progress_buf), "target %d bpm", s_target_bpm);
@@ -123,7 +148,30 @@ static void update_alarm_ui(int bpm) {
 static void alarm_tick(void *data) {
   HealthValue raw = health_service_peek_current_value(HealthMetricHeartRateRawBPM);
   int bpm = (int)raw;
-  bool calibrating = s_fresh_hr_events < 1;
+
+  if (s_phase == AlarmPhaseGrace) {
+    vibes_short_pulse();
+    s_grace_buzzes_done++;
+    if (s_grace_buzzes_done >= GRACE_BUZZ_COUNT) {
+      s_phase = AlarmPhaseCalibrating;
+      s_calibration_elapsed_secs = 0;
+    }
+    update_alarm_ui(bpm);
+    s_alarm_timer = app_timer_register(TICK_MS, alarm_tick, NULL);
+    return;
+  }
+
+  if (s_phase == AlarmPhaseCalibrating) {
+    s_calibration_elapsed_secs++;
+    // needs both the minimum settle time AND at least one confirmed-fresh
+    // reading; a fixed delay alone can't guarantee the sensor has produced
+    // a real sample yet
+    if (s_calibration_elapsed_secs >= s_calibration_min_secs && s_fresh_hr_events >= 1) {
+      s_phase = AlarmPhaseActive;
+    }
+  }
+
+  bool calibrating = s_phase != AlarmPhaseActive;
 
   if (!s_unlocked && !calibrating) {
     if (bpm >= s_target_bpm) {
@@ -205,6 +253,9 @@ static void alarm_window_load(Window *window) {
   s_fresh_hr_events = 0;
   s_alarm_active = true;
   s_unlocked = false;
+  s_phase = AlarmPhaseGrace;
+  s_grace_buzzes_done = 0;
+  s_calibration_elapsed_secs = 0;
   update_alarm_ui(0);
 
   s_alarm_timer = app_timer_register(TICK_MS, alarm_tick, NULL);
@@ -239,10 +290,34 @@ static void update_time(void) {
   text_layer_set_text(s_time_layer, buf);
 }
 
+typedef enum {
+  FieldTargetBpm,
+  FieldSustainSecs,
+  FieldDelayMinutes,
+  FieldCalibrationMinSecs,
+  FieldCount,
+} SettingField;
+
+static SettingField s_active_field = FieldTargetBpm;
+
 static void update_config_text(void) {
-  static char buf[64];
-  snprintf(buf, sizeof(buf), "%d bpm x %ds\nin %d min", s_target_bpm, s_sustain_secs, s_delay_minutes);
+  static char buf[80];
+  snprintf(buf, sizeof(buf), "%d bpm x %ds\nin %d min, calib %ds",
+           s_target_bpm, s_sustain_secs, s_delay_minutes, s_calibration_min_secs);
   text_layer_set_text(s_config_layer, buf);
+}
+
+static void update_hint_text(void) {
+  static char buf[80];
+  const char *field_name;
+  switch (s_active_field) {
+    case FieldTargetBpm: field_name = "target bpm"; break;
+    case FieldSustainSecs: field_name = "sustain secs"; break;
+    case FieldDelayMinutes: field_name = "delay min"; break;
+    default: field_name = "calib min secs"; break;
+  }
+  snprintf(buf, sizeof(buf), "UP/DOWN: %s\nBACK: change field\nhold SELECT: test now", field_name);
+  text_layer_set_text(s_hint_layer, buf);
 }
 
 static void tick_handler(struct tm *tick_time, TimeUnits units_changed) {
@@ -260,14 +335,40 @@ static void schedule_alarm(void) {
   text_layer_set_text(s_hint_layer, "Alarm armed");
 }
 
-static void up_click_handler(ClickRecognizerRef recognizer, void *context) {
-  s_target_bpm += 5;
+static void adjust_active_field(int delta) {
+  switch (s_active_field) {
+    case FieldTargetBpm:
+      s_target_bpm += delta * 5;
+      if (s_target_bpm < 40) s_target_bpm = 40;
+      break;
+    case FieldSustainSecs:
+      s_sustain_secs += delta * 5;
+      if (s_sustain_secs < 5) s_sustain_secs = 5;
+      break;
+    case FieldDelayMinutes:
+      s_delay_minutes += delta;
+      if (s_delay_minutes < 0) s_delay_minutes = 0;
+      break;
+    case FieldCalibrationMinSecs:
+    default:
+      s_calibration_min_secs += delta;
+      if (s_calibration_min_secs < 0) s_calibration_min_secs = 0;
+      break;
+  }
   update_config_text();
 }
 
+static void up_click_handler(ClickRecognizerRef recognizer, void *context) {
+  adjust_active_field(1);
+}
+
 static void down_click_handler(ClickRecognizerRef recognizer, void *context) {
-  if (s_target_bpm > 40) s_target_bpm -= 5;
-  update_config_text();
+  adjust_active_field(-1);
+}
+
+static void back_click_handler(ClickRecognizerRef recognizer, void *context) {
+  s_active_field = (s_active_field + 1) % FieldCount;
+  update_hint_text();
 }
 
 static void select_click_handler(ClickRecognizerRef recognizer, void *context) {
@@ -282,6 +383,7 @@ static void select_long_click_handler(ClickRecognizerRef recognizer, void *conte
 static void main_click_config_provider(void *context) {
   window_single_click_subscribe(BUTTON_ID_UP, up_click_handler);
   window_single_click_subscribe(BUTTON_ID_DOWN, down_click_handler);
+  window_single_click_subscribe(BUTTON_ID_BACK, back_click_handler);
   window_single_click_subscribe(BUTTON_ID_SELECT, select_click_handler);
   window_long_click_subscribe(BUTTON_ID_SELECT, 700, select_long_click_handler, NULL);
 }
@@ -295,19 +397,19 @@ static void main_window_load(Window *window) {
   text_layer_set_text_alignment(s_time_layer, GTextAlignmentCenter);
   layer_add_child(window_layer, text_layer_get_layer(s_time_layer));
 
-  s_config_layer = text_layer_create(GRect(0, 75, bounds.size.w, 50));
-  text_layer_set_font(s_config_layer, fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD));
+  s_config_layer = text_layer_create(GRect(0, 70, bounds.size.w, 55));
+  text_layer_set_font(s_config_layer, fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD));
   text_layer_set_text_alignment(s_config_layer, GTextAlignmentCenter);
   layer_add_child(window_layer, text_layer_get_layer(s_config_layer));
 
-  s_hint_layer = text_layer_create(GRect(0, 135, bounds.size.w, 45));
+  s_hint_layer = text_layer_create(GRect(0, 130, bounds.size.w, 60));
   text_layer_set_font(s_hint_layer, fonts_get_system_font(FONT_KEY_GOTHIC_18));
   text_layer_set_text_alignment(s_hint_layer, GTextAlignmentCenter);
-  text_layer_set_text(s_hint_layer, "UP/DOWN: bpm\nSELECT: arm\nhold SELECT: test now");
   layer_add_child(window_layer, text_layer_get_layer(s_hint_layer));
 
   update_time();
   update_config_text();
+  update_hint_text();
 }
 
 static void main_window_unload(Window *window) {
