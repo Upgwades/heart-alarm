@@ -126,9 +126,10 @@ static void alarm_tick(void *data) {
   }
   s_elapsed_seconds++;
 
-  // sound + vibration only run while HR is below the target threshold
-  // (during calibration, the reading isn't trustworthy yet, so keep alarming)
-  bool below_threshold = !s_unlocked && (calibrating || bpm < s_target_bpm);
+  // sound + vibration only run while HR is below the target threshold.
+  // During calibration the reading may still be the stale pre-alarm value,
+  // so stay silent until it's had time to settle.
+  bool below_threshold = !s_unlocked && !calibrating && bpm < s_target_bpm;
   if (below_threshold) {
     start_hr_alarm_vibe();
     start_hr_alarm_siren();
@@ -184,6 +185,8 @@ static void alarm_window_load(Window *window) {
   text_layer_set_text_alignment(s_alarm_debug_layer, GTextAlignmentCenter);
   layer_add_child(window_layer, text_layer_get_layer(s_alarm_debug_layer));
 
+  vibes_cancel();
+  speaker_stop();
   health_service_set_heart_rate_sample_period(HR_SAMPLE_PERIOD_SEC);
   s_sustained_seconds = 0;
   s_elapsed_seconds = 0;
