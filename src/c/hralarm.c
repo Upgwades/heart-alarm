@@ -3,8 +3,7 @@
 // --- config ---
 #define DEFAULT_TARGET_BPM 100
 #define DEFAULT_SUSTAIN_SECS 10
-#define DEFAULT_CALIBRATION_MIN_SECS 5
-#define GRACE_SECS 20               // testing default; bumped up from a few seconds
+#define DEFAULT_GRACE_SECS 20
 #define GRACE_BUZZ_INTERVAL_SECS 4  // buzz every N seconds during grace, not every tick
 #define HR_SAMPLE_PERIOD_SEC 1
 #define TICK_MS 1000
@@ -31,31 +30,36 @@ typedef struct {
 static Alarm s_alarms[MAX_ALARMS];
 static int s_active_alarm_index = -1;  // which alarm fired the current alarm session, -1 = manual test
 
+#define LIST_TOTAL_ROWS (MAX_ALARMS + 1)
+#define LIST_WINDOW_ROWS 3
+
 static Window *s_list_window;
 static TextLayer *s_list_title_layer;
-static TextLayer *s_list_body_layer;
+static TextLayer *s_list_row_layers[LIST_WINDOW_ROWS];
 static TextLayer *s_list_hint_layer;
-static int s_list_cursor = 0;  // 0..MAX_ALARMS-1 = alarm rows, MAX_ALARMS = "HR settings" row
-
-static Window *s_edit_window;
-static TextLayer *s_edit_big_layer;
-static TextLayer *s_edit_summary_layer;
-static TextLayer *s_edit_hint_layer;
-static int s_editing_alarm_index = -1;
+static int s_list_cursor = 0;  // 0 = "HR settings" row, 1..MAX_ALARMS = alarm rows
+static int s_list_scroll = 0;  // index of the item shown in the topmost visible row
 
 typedef enum {
   EFEnabled, EFHour, EFMinute, EFSun, EFMon, EFTue, EFWed, EFThu, EFFri, EFSat, EFCount,
 } EditField;
-static EditField s_edit_field = EFEnabled;
 
-static Window *s_settings_window;
-static TextLayer *s_settings_big_layer;
-static TextLayer *s_settings_summary_layer;
-static TextLayer *s_settings_hint_layer;
+#define EDIT_VISIBLE_ROWS 4
+
+static Window *s_edit_window;
+static TextLayer *s_edit_field_layers[EDIT_VISIBLE_ROWS];
+static TextLayer *s_edit_hint_layer;
+static int s_editing_alarm_index = -1;
+static EditField s_edit_field = EFEnabled;
+static int s_edit_scroll = 0;  // index of the field shown in the topmost visible row
 
 typedef enum {
-  FieldTargetBpm, FieldSustainSecs, FieldCalibrationMinSecs, FieldCount,
+  FieldTargetBpm, FieldSustainSecs, FieldGraceSecs, FieldCount,
 } SettingField;
+
+static Window *s_settings_window;
+static TextLayer *s_settings_field_layers[FieldCount];
+static TextLayer *s_settings_hint_layer;
 static SettingField s_active_field = FieldTargetBpm;
 
 static Window *s_alarm_window;
@@ -69,11 +73,10 @@ static GColor s_progress_color;
 
 static int s_target_bpm = DEFAULT_TARGET_BPM;
 static int s_sustain_secs = DEFAULT_SUSTAIN_SECS;
-static int s_calibration_min_secs = DEFAULT_CALIBRATION_MIN_SECS;
+static int s_grace_secs = DEFAULT_GRACE_SECS;
 
 static int s_sustained_seconds = 0;
 static int s_elapsed_seconds = 0;
-static bool s_unlocked = false;
 static AppTimer *s_alarm_timer;
 
 static AlarmPhase s_phase = AlarmPhaseGrace;
@@ -96,14 +99,14 @@ static void health_event_handler(HealthEventType event, void *context) {
 enum {
   PKEY_TARGET_BPM = 100,
   PKEY_SUSTAIN_SECS = 101,
-  PKEY_CALIBRATION_MIN_SECS = 104,
+  PKEY_GRACE_SECS = 105,
   PKEY_ALARMS = 110,
 };
 
 static void load_settings(void) {
   if (persist_exists(PKEY_TARGET_BPM)) s_target_bpm = persist_read_int(PKEY_TARGET_BPM);
   if (persist_exists(PKEY_SUSTAIN_SECS)) s_sustain_secs = persist_read_int(PKEY_SUSTAIN_SECS);
-  if (persist_exists(PKEY_CALIBRATION_MIN_SECS)) s_calibration_min_secs = persist_read_int(PKEY_CALIBRATION_MIN_SECS);
+  if (persist_exists(PKEY_GRACE_SECS)) s_grace_secs = persist_read_int(PKEY_GRACE_SECS);
 
   if (persist_exists(PKEY_ALARMS)) {
     persist_read_data(PKEY_ALARMS, s_alarms, sizeof(s_alarms));
@@ -117,7 +120,7 @@ static void load_settings(void) {
 static void save_settings(void) {
   persist_write_int(PKEY_TARGET_BPM, s_target_bpm);
   persist_write_int(PKEY_SUSTAIN_SECS, s_sustain_secs);
-  persist_write_int(PKEY_CALIBRATION_MIN_SECS, s_calibration_min_secs);
+  persist_write_int(PKEY_GRACE_SECS, s_grace_secs);
 }
 
 static void save_alarms(void) {
@@ -193,10 +196,237 @@ static void format_days_summary(uint8_t mask, char *buf, size_t n) {
   }
 }
 
+// ---------- pixel heart (unlocked/success celebration) ----------
+// hand-authored bitmap + an integer pulse-size table: deliberately zero
+// floating-point/libm calls (no sinf, no curve math) after those were the
+// prime suspect in a hard fault the first time this screen ever rendered
+#define HEART_GRID_W 17
+#define HEART_GRID_H 15
+#define HEART_OUTLINE_THICKNESS 2
+
+// per-row filled column ranges (inclusive); a second span lets the top two
+// rows show the heart's twin lobes before they merge. {-1,-1} = unused.
+typedef struct { int8_t l1, r1, l2, r2; } HeartRowSpans;
+static const HeartRowSpans kHeartRows[HEART_GRID_H] = {
+  { 2,  5, 11, 14},  // row 0: two separate lobe tops
+  { 1,  6, 10, 15},  // row 1
+  { 0,  7,  9, 16},  // row 2: lobes almost touching
+  { 0, 16, -1, -1},  // row 3: lobes merged, widest point
+  { 0, 16, -1, -1},  // row 4
+  { 0, 16, -1, -1},  // row 5
+  { 1, 15, -1, -1},  // row 6
+  { 1, 15, -1, -1},  // row 7
+  { 2, 14, -1, -1},  // row 8
+  { 3, 13, -1, -1},  // row 9
+  { 4, 12, -1, -1},  // row 10
+  { 5, 11, -1, -1},  // row 11
+  { 6, 10, -1, -1},  // row 12
+  { 7,  9, -1, -1},  // row 13
+  { 8,  8, -1, -1},  // row 14: bottom point
+};
+
+static bool s_heart_outline[HEART_GRID_H][HEART_GRID_W];
+static bool s_heart_computed = false;
+static Layer *s_heart_layer;
+static AppTimer *s_heart_timer;
+
+static bool heart_shape_filled(int row, int col) {
+  if (row < 0 || row >= HEART_GRID_H) return false;
+  const HeartRowSpans *s = &kHeartRows[row];
+  if (col >= s->l1 && col <= s->r1) return true;
+  if (s->r2 >= s->l2 && col >= s->l2 && col <= s->r2) return true;
+  return false;
+}
+
+// a cell is "deep interior" (and thus left uncolored) if every cell within
+// HEART_OUTLINE_THICKNESS is also filled; the remaining shell is the outline
+static bool heart_deep_interior(int row, int col) {
+  for (int dr = -HEART_OUTLINE_THICKNESS; dr <= HEART_OUTLINE_THICKNESS; dr++) {
+    for (int dc = -HEART_OUTLINE_THICKNESS; dc <= HEART_OUTLINE_THICKNESS; dc++) {
+      int c = col + dc;
+      if (c < 0 || c >= HEART_GRID_W || !heart_shape_filled(row + dr, c)) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+static void heart_generate_outline(void) {
+  for (int r = 0; r < HEART_GRID_H; r++) {
+    for (int c = 0; c < HEART_GRID_W; c++) {
+      s_heart_outline[r][c] = heart_shape_filled(r, c) && !heart_deep_interior(r, c);
+    }
+  }
+  s_heart_computed = true;
+}
+
+// integer pixel sizes cycling through one pulse (grow then shrink); no floats
+static const int8_t kHeartPulseSizes[] = {4, 5, 6, 7, 7, 6, 5, 4};
+#define HEART_PULSE_STEPS (int)(sizeof(kHeartPulseSizes) / sizeof(kHeartPulseSizes[0]))
+static int s_heart_pulse_step = 0;
+
+static void heart_draw_proc(Layer *layer, GContext *ctx) {
+  if (!s_heart_computed) heart_generate_outline();
+
+  GRect bounds = layer_get_bounds(layer);
+  int16_t px = kHeartPulseSizes[s_heart_pulse_step % HEART_PULSE_STEPS];
+  int16_t grid_w = px * HEART_GRID_W;
+  int16_t grid_h = px * HEART_GRID_H;
+  int16_t ox = bounds.origin.x + (bounds.size.w - grid_w) / 2;
+  int16_t oy = bounds.origin.y + (bounds.size.h - grid_h) / 2;
+
+  // varied deep-red/maroon palette per pixel, mosaic-style like the reference
+  // image; no pink/orange tones, just dark blood-red shades; B&W displays
+  // have no red at all, so they fall back to solid black
+  static const GColor kOutlinePalette[] = {
+    GColorBulgarianRose, GColorDarkCandyAppleRed, GColorDarkCandyAppleRed,
+    GColorBulgarianRose, GColorDarkCandyAppleRed, GColorBulgarianRose,
+    GColorFolly,
+  };
+  #define HEART_OUTLINE_PALETTE_SIZE (int)(sizeof(kOutlinePalette) / sizeof(kOutlinePalette[0]))
+
+  for (int r = 0; r < HEART_GRID_H; r++) {
+    for (int c = 0; c < HEART_GRID_W; c++) {
+      if (heart_shape_filled(r, c)) {
+        // multiplicative hash of (r,c) for a scrambled, non-diagonal-looking
+        // dither pattern rather than a simple repeating stripe
+        unsigned hash = (unsigned)(r * 2654435761u) ^ (unsigned)(c * 40503u);
+        GColor fill = PBL_IF_COLOR_ELSE(kOutlinePalette[hash % HEART_OUTLINE_PALETTE_SIZE], GColorBlack);
+        graphics_context_set_fill_color(ctx, fill);
+        graphics_fill_rect(ctx, GRect(ox + c * px, oy + r * px, px, px), 0, GCornerNone);
+      }
+    }
+  }
+}
+
+static int s_heart_pulses_remaining = 0;
+static void (*s_heart_pulse_done_cb)(void) = NULL;
+
+static void heart_pulse_tick(void *data) {
+  s_heart_pulse_step++;
+  if (s_heart_pulse_step % HEART_PULSE_STEPS == 0 && s_heart_pulses_remaining > 0
+      && --s_heart_pulses_remaining == 0) {
+    void (*done_cb)(void) = s_heart_pulse_done_cb;
+    s_heart_timer = NULL;
+    s_heart_pulse_done_cb = NULL;
+    if (s_heart_layer) {
+      layer_mark_dirty(s_heart_layer);
+    }
+    if (done_cb) {
+      done_cb();
+    }
+    return;
+  }
+  if (s_heart_layer) {
+    layer_mark_dirty(s_heart_layer);
+  }
+  s_heart_timer = app_timer_register(180, heart_pulse_tick, NULL);
+}
+
+// pulses the heart layer `pulse_count` full cycles, then calls done_cb (may
+// be NULL for an indefinite pulse the caller stops manually via heart_pulse_stop)
+static void heart_pulse_start(int pulse_count, void (*done_cb)(void)) {
+  s_heart_pulse_step = 0;
+  s_heart_pulses_remaining = pulse_count;
+  s_heart_pulse_done_cb = done_cb;
+  if (!s_heart_timer) {
+    s_heart_timer = app_timer_register(180, heart_pulse_tick, NULL);
+  }
+}
+
+static void heart_pulse_stop(void) {
+  if (s_heart_timer) {
+    app_timer_cancel(s_heart_timer);
+    s_heart_timer = NULL;
+  }
+  s_heart_pulse_done_cb = NULL;
+}
+
+// ---------- celebration window (own screen, auto-dismisses) ----------
+#define CELEBRATION_PULSE_COUNT 3
+
+static Window *s_celebration_window;
+static TextLayer *s_celebration_status_layer;
+
+// ends the just-finished alarm session's bookkeeping: stop timers/sound/HR
+// sampling and line up the alarm's next occurrence. Called once, right when
+// the sustain target is hit, before handing off to the celebration screen.
+static void finish_alarm_session(void) {
+  if (s_alarm_timer) {
+    app_timer_cancel(s_alarm_timer);
+    s_alarm_timer = NULL;
+  }
+  vibes_cancel();
+  speaker_stop();
+  s_alarm_active = false;
+  health_service_set_heart_rate_sample_period(0);
+
+  if (s_active_alarm_index >= 0) {
+    // this alarm was a real scheduled one, not a manual test: line up its
+    // next occurrence per its day-of-week repeat mask
+    schedule_alarm_index(s_active_alarm_index);
+    s_active_alarm_index = -1;
+  }
+}
+
+static void celebration_finish(void) {
+  heart_pulse_stop();
+  window_stack_pop(true);
+}
+
+static void celebration_click_handler(ClickRecognizerRef recognizer, void *context) {
+  celebration_finish();  // let the user skip the wait
+}
+
+static void celebration_click_config_provider(void *context) {
+  window_single_click_subscribe(BUTTON_ID_SELECT, celebration_click_handler);
+  window_single_click_subscribe(BUTTON_ID_BACK, celebration_click_handler);
+}
+
+static void celebration_window_load(Window *window) {
+  Layer *window_layer = window_get_root_layer(window);
+  GRect bounds = layer_get_bounds(window_layer);
+  int16_t h = bounds.size.h;
+
+  window_set_background_color(window, GColorWhite);
+
+  s_celebration_status_layer = text_layer_create(GRect(0, h * 8 / 100, bounds.size.w, h * 16 / 100));
+  text_layer_set_background_color(s_celebration_status_layer, GColorClear);
+  text_layer_set_text_color(s_celebration_status_layer, GColorBlack);
+  text_layer_set_font(s_celebration_status_layer, fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD));
+  text_layer_set_text_alignment(s_celebration_status_layer, GTextAlignmentCenter);
+  text_layer_set_text(s_celebration_status_layer, "Great job!");
+  layer_add_child(window_layer, text_layer_get_layer(s_celebration_status_layer));
+
+  s_heart_layer = layer_create(GRect(0, h * 26 / 100, bounds.size.w, h * 60 / 100));
+  layer_set_update_proc(s_heart_layer, heart_draw_proc);
+  layer_add_child(window_layer, s_heart_layer);
+
+  heart_pulse_start(CELEBRATION_PULSE_COUNT, celebration_finish);
+}
+
+static void celebration_window_unload(Window *window) {
+  heart_pulse_stop();
+  layer_destroy(s_heart_layer);
+  text_layer_destroy(s_celebration_status_layer);
+}
+
+static void enter_celebration_mode(void) {
+  s_celebration_window = window_create();
+  window_set_click_config_provider(s_celebration_window, celebration_click_config_provider);
+  window_set_window_handlers(s_celebration_window, (WindowHandlers) {
+    .load = celebration_window_load,
+    .unload = celebration_window_unload,
+  });
+  window_stack_push(s_celebration_window, true);
+}
+
 // ---------- alarm window ----------
 static void start_grace_vibe(void) {
-  // stronger than a single short pulse: three firm buzzes back to back
-  static const uint32_t segments[] = {400, 100, 400, 100, 400};
+  // near-continuous hard buzzing to actually wake the wearer, matching the
+  // intensity of the main HR alarm vibe rather than a few gentle taps
+  static const uint32_t segments[] = {700, 50, 700, 50, 700, 50, 700, 50};
   VibePattern pattern = {
     .durations = segments,
     .num_segments = ARRAY_LENGTH(segments),
@@ -255,21 +485,18 @@ static void progress_bar_draw_proc(Layer *layer, GContext *ctx) {
 static void apply_alarm_theme(int bpm) {
   GColor bg, fg;
 
-  if (s_unlocked) {
-    bg = PBL_IF_COLOR_ELSE(GColorGreen, GColorWhite);
-    fg = GColorBlack;
-    s_progress_color = GColorBlack;
-    s_progress_fraction = 1.f;
-  } else if (s_phase == AlarmPhaseGrace) {
+  if (s_phase == AlarmPhaseGrace) {
     bg = PBL_IF_COLOR_ELSE(GColorOrange, GColorWhite);
     fg = GColorBlack;
     s_progress_color = GColorBlack;
-    s_progress_fraction = (float)s_grace_elapsed_secs / GRACE_SECS;
+    s_progress_fraction = (float)s_grace_elapsed_secs / s_grace_secs;
   } else if (s_phase == AlarmPhaseCalibrating) {
     bg = PBL_IF_COLOR_ELSE(GColorVividCerulean, GColorWhite);
     fg = GColorBlack;
     s_progress_color = GColorBlack;
-    s_progress_fraction = (float)s_calibration_elapsed_secs / s_calibration_min_secs;
+    // no fixed duration any more - this phase ends purely on a clean HR
+    // sample, so just pulse the bar to show activity rather than progress
+    s_progress_fraction = (s_calibration_elapsed_secs % 2 == 0) ? 0.3f : 0.7f;
   } else {
     // active phase: red while below threshold (flashing for urgency),
     // shifting toward green as sustain progress builds
@@ -299,27 +526,26 @@ static void apply_alarm_theme(int bpm) {
 static void update_alarm_ui(int bpm) {
   static char bpm_buf[32];
   static char status_buf[48];
-  static char progress_buf[24];
+  static char progress_buf[32];
 
-  bool reading_trustworthy = (s_phase == AlarmPhaseActive) || s_unlocked;
-  if (bpm <= 0 || !reading_trustworthy) {
-    // don't show a number until it's confirmed fresh, to avoid displaying
-    // a stale reading left over from before the alarm started
+  if (s_phase != AlarmPhaseActive) {
+    // not actively monitoring HR yet (still in grace/calibration): don't
+    // show a counter at all, not even a placeholder
+    bpm_buf[0] = '\0';
+  } else if (bpm <= 0) {
+    // actively monitoring, but no fresh sample yet
     snprintf(bpm_buf, sizeof(bpm_buf), "-- BPM");
   } else {
     snprintf(bpm_buf, sizeof(bpm_buf), "%d BPM", bpm);
   }
   text_layer_set_text(s_alarm_bpm_layer, bpm_buf);
 
-  if (s_unlocked) {
-    snprintf(status_buf, sizeof(status_buf), "UNLOCKED");
-    snprintf(progress_buf, sizeof(progress_buf), "press SELECT to stop");
-  } else if (s_phase == AlarmPhaseGrace) {
+  if (s_phase == AlarmPhaseGrace) {
     snprintf(status_buf, sizeof(status_buf), "WAKE UP");
-    snprintf(progress_buf, sizeof(progress_buf), "%d/%d seconds", s_grace_elapsed_secs, GRACE_SECS);
+    snprintf(progress_buf, sizeof(progress_buf), "%d/%d seconds", s_grace_elapsed_secs, s_grace_secs);
   } else if (s_phase == AlarmPhaseCalibrating) {
     snprintf(status_buf, sizeof(status_buf), "Calibrating...");
-    snprintf(progress_buf, sizeof(progress_buf), "%d/%d seconds", s_calibration_elapsed_secs, s_calibration_min_secs);
+    snprintf(progress_buf, sizeof(progress_buf), "waiting for clean reading");
   } else if (bpm <= 0) {
     snprintf(status_buf, sizeof(status_buf), "Measuring...");
     snprintf(progress_buf, sizeof(progress_buf), "target %d bpm", s_target_bpm);
@@ -345,7 +571,7 @@ static void alarm_tick(void *data) {
       start_grace_vibe();
     }
     s_grace_elapsed_secs++;
-    if (s_grace_elapsed_secs >= GRACE_SECS) {
+    if (s_grace_elapsed_secs >= s_grace_secs) {
       s_phase = AlarmPhaseCalibrating;
       s_calibration_elapsed_secs = 0;
     }
@@ -356,22 +582,27 @@ static void alarm_tick(void *data) {
 
   if (s_phase == AlarmPhaseCalibrating) {
     s_calibration_elapsed_secs++;
-    // needs both the minimum settle time AND at least one confirmed-fresh
-    // reading; a fixed delay alone can't guarantee the sensor has produced
-    // a real sample yet
-    if (s_calibration_elapsed_secs >= s_calibration_min_secs && s_fresh_hr_events >= 1) {
+    // gated purely on a confirmed-fresh HR sample: peek_current_value can
+    // keep returning a stale pre-alarm reading for an unpredictable amount
+    // of time, so there's no fixed delay that reliably guarantees a real one
+    if (s_fresh_hr_events >= 1) {
       s_phase = AlarmPhaseActive;
     }
   }
 
   bool calibrating = s_phase != AlarmPhaseActive;
 
-  if (!s_unlocked && !calibrating) {
+  if (!calibrating) {
     if (bpm >= s_target_bpm) {
       s_sustained_seconds++;
       if (s_sustained_seconds >= s_sustain_secs) {
-        s_unlocked = true;
+        // sustain target hit: finish this alarm session and hand off to the
+        // celebration screen, rather than lingering here
         start_success_vibe();
+        finish_alarm_session();
+        window_stack_pop(true);
+        enter_celebration_mode();
+        return;
       }
     } else {
       s_sustained_seconds = 0;
@@ -382,7 +613,7 @@ static void alarm_tick(void *data) {
   // sound + vibration only run while HR is below the target threshold.
   // During calibration the reading may still be the stale pre-alarm value,
   // so stay silent until it's had time to settle.
-  bool below_threshold = !s_unlocked && !calibrating && bpm < s_target_bpm;
+  bool below_threshold = !calibrating && bpm < s_target_bpm;
   if (below_threshold) {
     start_hr_alarm_vibe();
     start_hr_alarm_siren();
@@ -396,31 +627,18 @@ static void alarm_tick(void *data) {
 }
 
 static void alarm_select_click_handler(ClickRecognizerRef recognizer, void *context) {
-  if (!s_unlocked) {
-    // locked: ignore, can't dismiss until sustained HR target hit
-    return;
-  }
-  if (s_alarm_timer) {
-    app_timer_cancel(s_alarm_timer);
-    s_alarm_timer = NULL;
-  }
-  vibes_cancel();
-  speaker_stop();
-  s_alarm_active = false;
-  health_service_set_heart_rate_sample_period(0);
+  // this screen is never manually dismissible: reaching the sustain target
+  // automatically advances to the celebration screen instead
+}
 
-  if (s_active_alarm_index >= 0) {
-    // this alarm was a real scheduled one, not a manual test: line up its
-    // next occurrence per its day-of-week repeat mask
-    schedule_alarm_index(s_active_alarm_index);
-    s_active_alarm_index = -1;
-  }
-
-  window_stack_pop(true);
+static void alarm_back_click_handler(ClickRecognizerRef recognizer, void *context) {
+  // swallow BACK so it can't fall through to the default window-pop
+  // behavior (that gap previously left a dangling timer and crashed)
 }
 
 static void alarm_click_config_provider(void *context) {
   window_single_click_subscribe(BUTTON_ID_SELECT, alarm_select_click_handler);
+  window_single_click_subscribe(BUTTON_ID_BACK, alarm_back_click_handler);
 }
 
 static void alarm_window_load(Window *window) {
@@ -457,7 +675,6 @@ static void alarm_window_load(Window *window) {
   s_elapsed_seconds = 0;
   s_fresh_hr_events = 0;
   s_alarm_active = true;
-  s_unlocked = false;
   s_phase = AlarmPhaseGrace;
   s_grace_elapsed_secs = 0;
   s_calibration_elapsed_secs = 0;
@@ -467,9 +684,18 @@ static void alarm_window_load(Window *window) {
 }
 
 static void alarm_window_unload(Window *window) {
+  // defensive cleanup in case this window is ever torn down through a path
+  // other than the finish_alarm_session() call in alarm_tick (e.g. the OS
+  // force-closing the app) - finish_alarm_session() already made these calls
+  // in the normal path, so these are idempotent no-ops there
+  if (s_alarm_timer) {
+    app_timer_cancel(s_alarm_timer);
+    s_alarm_timer = NULL;
+  }
   vibes_cancel();
   speaker_stop();
   s_alarm_active = false;
+  health_service_set_heart_rate_sample_period(0);
   layer_destroy(s_alarm_progress_bar_layer);
   text_layer_destroy(s_alarm_bpm_layer);
   text_layer_destroy(s_alarm_status_layer);
@@ -488,28 +714,27 @@ static void enter_alarm_mode(void) {
 
 // ---------- HR settings window (shared across all alarms) ----------
 static void settings_update_text(void) {
-  static char big[16];
-  static char summary[96];
-  static char hint[100];
+  static char field_text[FieldCount][40];
 
-  switch (s_active_field) {
-    case FieldTargetBpm: snprintf(big, sizeof(big), "%d", s_target_bpm); break;
-    case FieldSustainSecs: snprintf(big, sizeof(big), "%d", s_sustain_secs); break;
-    default: snprintf(big, sizeof(big), "%d", s_calibration_min_secs); break;
+  snprintf(field_text[FieldTargetBpm], sizeof(field_text[FieldTargetBpm]),
+           "%sTarget: %d bpm", s_active_field == FieldTargetBpm ? "> " : "", s_target_bpm);
+  snprintf(field_text[FieldSustainSecs], sizeof(field_text[FieldSustainSecs]),
+           "%sSustain: %d seconds", s_active_field == FieldSustainSecs ? "> " : "", s_sustain_secs);
+  snprintf(field_text[FieldGraceSecs], sizeof(field_text[FieldGraceSecs]),
+           "%sGrace: %d seconds", s_active_field == FieldGraceSecs ? "> " : "", s_grace_secs);
+
+  for (int i = 0; i < FieldCount; i++) {
+    bool active = (i == s_active_field);
+    text_layer_set_text(s_settings_field_layers[i], field_text[i]);
+    text_layer_set_font(s_settings_field_layers[i], fonts_get_system_font(
+        active ? FONT_KEY_GOTHIC_24_BOLD : FONT_KEY_GOTHIC_24));
+    text_layer_set_text_color(s_settings_field_layers[i], active
+        ? PBL_IF_COLOR_ELSE(GColorRed, GColorBlack)
+        : GColorFromRGB(64, 64, 64));
   }
-  text_layer_set_text(s_settings_big_layer, big);
 
-  snprintf(summary, sizeof(summary), "target %d bpm\nsustain %d seconds\ncalibration minimum %d seconds",
-           s_target_bpm, s_sustain_secs, s_calibration_min_secs);
-  text_layer_set_text(s_settings_summary_layer, summary);
-
-  const char *field_name;
-  switch (s_active_field) {
-    case FieldTargetBpm: field_name = "target heart rate"; break;
-    case FieldSustainSecs: field_name = "sustain duration"; break;
-    default: field_name = "calibration minimum"; break;
-  }
-  snprintf(hint, sizeof(hint), "editing: %s\nUP/DOWN: change\nSELECT: next field\nhold SELECT: save & exit", field_name);
+  static char hint[80];
+  snprintf(hint, sizeof(hint), "UP/DOWN: change\nSELECT: next field\nhold SELECT: save & exit");
   text_layer_set_text(s_settings_hint_layer, hint);
 }
 
@@ -517,7 +742,7 @@ static void settings_up_click_handler(ClickRecognizerRef recognizer, void *conte
   switch (s_active_field) {
     case FieldTargetBpm: s_target_bpm += 5; break;
     case FieldSustainSecs: s_sustain_secs += 5; break;
-    default: s_calibration_min_secs += 1; break;
+    default: s_grace_secs += 5; break;
   }
   save_settings();
   settings_update_text();
@@ -527,7 +752,7 @@ static void settings_down_click_handler(ClickRecognizerRef recognizer, void *con
   switch (s_active_field) {
     case FieldTargetBpm: if (s_target_bpm > 40) s_target_bpm -= 5; break;
     case FieldSustainSecs: if (s_sustain_secs > 5) s_sustain_secs -= 5; break;
-    default: if (s_calibration_min_secs > 0) s_calibration_min_secs -= 1; break;
+    default: if (s_grace_secs > 5) s_grace_secs -= 5; break;
   }
   save_settings();
   settings_update_text();
@@ -556,25 +781,19 @@ static void settings_window_load(Window *window) {
   GRect bounds = layer_get_bounds(window_layer);
   int16_t h = bounds.size.h;
 
-  window_set_background_color(window, PBL_IF_COLOR_ELSE(GColorOxfordBlue, GColorWhite));
+  window_set_background_color(window, GColorWhite);
 
-  s_settings_big_layer = text_layer_create(GRect(0, h * 8 / 100, bounds.size.w, h * 26 / 100));
-  text_layer_set_background_color(s_settings_big_layer, GColorClear);
-  text_layer_set_text_color(s_settings_big_layer, PBL_IF_COLOR_ELSE(GColorWhite, GColorBlack));
-  text_layer_set_font(s_settings_big_layer, fonts_get_system_font(FONT_KEY_BITHAM_42_BOLD));
-  text_layer_set_text_alignment(s_settings_big_layer, GTextAlignmentCenter);
-  layer_add_child(window_layer, text_layer_get_layer(s_settings_big_layer));
+  for (int i = 0; i < FieldCount; i++) {
+    s_settings_field_layers[i] = text_layer_create(
+        GRect(6, h * (6 + i * 16) / 100, bounds.size.w - 12, h * 16 / 100));
+    text_layer_set_background_color(s_settings_field_layers[i], GColorClear);
+    text_layer_set_text_alignment(s_settings_field_layers[i], GTextAlignmentLeft);
+    layer_add_child(window_layer, text_layer_get_layer(s_settings_field_layers[i]));
+  }
 
-  s_settings_summary_layer = text_layer_create(GRect(0, h * 36 / 100, bounds.size.w, h * 26 / 100));
-  text_layer_set_background_color(s_settings_summary_layer, GColorClear);
-  text_layer_set_text_color(s_settings_summary_layer, PBL_IF_COLOR_ELSE(GColorElectricBlue, GColorBlack));
-  text_layer_set_font(s_settings_summary_layer, fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD));
-  text_layer_set_text_alignment(s_settings_summary_layer, GTextAlignmentCenter);
-  layer_add_child(window_layer, text_layer_get_layer(s_settings_summary_layer));
-
-  s_settings_hint_layer = text_layer_create(GRect(0, h * 64 / 100, bounds.size.w, h * 36 / 100));
+  s_settings_hint_layer = text_layer_create(GRect(0, h * 72 / 100, bounds.size.w, h * 28 / 100));
   text_layer_set_background_color(s_settings_hint_layer, GColorClear);
-  text_layer_set_text_color(s_settings_hint_layer, PBL_IF_COLOR_ELSE(GColorLightGray, GColorDarkGray));
+  text_layer_set_text_color(s_settings_hint_layer, GColorFromRGB(64, 64, 64));
   text_layer_set_font(s_settings_hint_layer, fonts_get_system_font(FONT_KEY_GOTHIC_14));
   text_layer_set_text_alignment(s_settings_hint_layer, GTextAlignmentCenter);
   layer_add_child(window_layer, text_layer_get_layer(s_settings_hint_layer));
@@ -583,8 +802,9 @@ static void settings_window_load(Window *window) {
 }
 
 static void settings_window_unload(Window *window) {
-  text_layer_destroy(s_settings_big_layer);
-  text_layer_destroy(s_settings_summary_layer);
+  for (int i = 0; i < FieldCount; i++) {
+    text_layer_destroy(s_settings_field_layers[i]);
+  }
   text_layer_destroy(s_settings_hint_layer);
 }
 
@@ -600,40 +820,42 @@ static void enter_settings_screen(void) {
 }
 
 // ---------- per-alarm edit window ----------
-static void edit_update_text(void) {
+static const char *const kEditFieldLabels[EFCount] = {
+  "Enabled", "Hour", "Minute", "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
+};
+
+static void edit_field_text(int i, char *out, size_t out_len) {
   Alarm *a = &s_alarms[s_editing_alarm_index];
-  static char big[16];
-  static char summary[64];
-  static char hint[100];
-  static char days_buf[32];
-
-  switch (s_edit_field) {
-    case EFEnabled: snprintf(big, sizeof(big), "%s", a->enabled ? "ON" : "OFF"); break;
-    case EFHour: snprintf(big, sizeof(big), "%02d", a->hour); break;
-    case EFMinute: snprintf(big, sizeof(big), "%02d", a->minute); break;
-    default: {
-      int day = s_edit_field - EFSun;
-      static const char *const names[7] = { "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
-      snprintf(big, sizeof(big), "%s %s", names[day], (a->days_mask & (1 << day)) ? "ON" : "OFF");
-      break;
-    }
+  const char *prefix = (i == s_edit_field) ? "> " : "";
+  if (i == EFHour) {
+    snprintf(out, out_len, "%s%s: %02d", prefix, kEditFieldLabels[i], a->hour);
+  } else if (i == EFMinute) {
+    snprintf(out, out_len, "%s%s: %02d", prefix, kEditFieldLabels[i], a->minute);
+  } else if (i == EFEnabled) {
+    snprintf(out, out_len, "%s%s: %s", prefix, kEditFieldLabels[i], a->enabled ? "On" : "Off");
+  } else {
+    int day = i - EFSun;
+    snprintf(out, out_len, "%s%s: %s", prefix, kEditFieldLabels[i],
+             (a->days_mask & (1 << day)) ? "On" : "Off");
   }
-  text_layer_set_text(s_edit_big_layer, big);
+}
 
-  format_days_summary(a->days_mask, days_buf, sizeof(days_buf));
-  snprintf(summary, sizeof(summary), "%02d:%02d  %s\n%s", a->hour, a->minute, days_buf,
-           a->enabled ? "enabled" : "disabled");
-  text_layer_set_text(s_edit_summary_layer, summary);
+static void edit_update_text(void) {
+  static char field_text[EDIT_VISIBLE_ROWS][32];
 
-  const char *field_name;
-  switch (s_edit_field) {
-    case EFEnabled: field_name = "on or off"; break;
-    case EFHour: field_name = "hour"; break;
-    case EFMinute: field_name = "minute"; break;
-    default: field_name = "day toggle"; break;
+  for (int row = 0; row < EDIT_VISIBLE_ROWS; row++) {
+    int i = s_edit_scroll + row;
+    bool active = (i == s_edit_field);
+    edit_field_text(i, field_text[row], sizeof(field_text[row]));
+    text_layer_set_text(s_edit_field_layers[row], field_text[row]);
+    text_layer_set_font(s_edit_field_layers[row], fonts_get_system_font(
+        active ? FONT_KEY_GOTHIC_24_BOLD : FONT_KEY_GOTHIC_24));
+    text_layer_set_text_color(s_edit_field_layers[row], active
+        ? PBL_IF_COLOR_ELSE(GColorRed, GColorBlack)
+        : GColorFromRGB(64, 64, 64));
   }
-  snprintf(hint, sizeof(hint), "editing: %s\nUP/DOWN: change\nSELECT: next field\nhold SELECT: save & exit", field_name);
-  text_layer_set_text(s_edit_hint_layer, hint);
+
+  text_layer_set_text(s_edit_hint_layer, "UP/DOWN: change\nSELECT: next field\nhold SELECT: save & exit");
 }
 
 static void edit_apply_and_reschedule(void) {
@@ -666,6 +888,11 @@ static void edit_down_click_handler(ClickRecognizerRef recognizer, void *context
 
 static void edit_select_click_handler(ClickRecognizerRef recognizer, void *context) {
   s_edit_field = (s_edit_field + 1) % EFCount;
+  if (s_edit_field == 0) {
+    s_edit_scroll = 0;  // wrapped back to the first field: scroll back to top
+  } else if (s_edit_field >= s_edit_scroll + EDIT_VISIBLE_ROWS) {
+    s_edit_scroll = s_edit_field - EDIT_VISIBLE_ROWS + 1;
+  }
   edit_update_text();
 }
 
@@ -688,36 +915,32 @@ static void edit_window_load(Window *window) {
   GRect bounds = layer_get_bounds(window_layer);
   int16_t h = bounds.size.h;
 
-  window_set_background_color(window, PBL_IF_COLOR_ELSE(GColorOxfordBlue, GColorWhite));
+  window_set_background_color(window, GColorWhite);
 
-  s_edit_big_layer = text_layer_create(GRect(0, h * 8 / 100, bounds.size.w, h * 26 / 100));
-  text_layer_set_background_color(s_edit_big_layer, GColorClear);
-  text_layer_set_text_color(s_edit_big_layer, PBL_IF_COLOR_ELSE(GColorWhite, GColorBlack));
-  text_layer_set_font(s_edit_big_layer, fonts_get_system_font(FONT_KEY_BITHAM_42_BOLD));
-  text_layer_set_text_alignment(s_edit_big_layer, GTextAlignmentCenter);
-  layer_add_child(window_layer, text_layer_get_layer(s_edit_big_layer));
+  for (int i = 0; i < EDIT_VISIBLE_ROWS; i++) {
+    s_edit_field_layers[i] = text_layer_create(
+        GRect(6, h * (6 + i * 16) / 100, bounds.size.w - 12, h * 16 / 100));
+    text_layer_set_background_color(s_edit_field_layers[i], GColorClear);
+    text_layer_set_text_alignment(s_edit_field_layers[i], GTextAlignmentLeft);
+    layer_add_child(window_layer, text_layer_get_layer(s_edit_field_layers[i]));
+  }
 
-  s_edit_summary_layer = text_layer_create(GRect(0, h * 36 / 100, bounds.size.w, h * 26 / 100));
-  text_layer_set_background_color(s_edit_summary_layer, GColorClear);
-  text_layer_set_text_color(s_edit_summary_layer, PBL_IF_COLOR_ELSE(GColorElectricBlue, GColorBlack));
-  text_layer_set_font(s_edit_summary_layer, fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD));
-  text_layer_set_text_alignment(s_edit_summary_layer, GTextAlignmentCenter);
-  layer_add_child(window_layer, text_layer_get_layer(s_edit_summary_layer));
-
-  s_edit_hint_layer = text_layer_create(GRect(0, h * 64 / 100, bounds.size.w, h * 36 / 100));
+  s_edit_hint_layer = text_layer_create(GRect(0, h * 72 / 100, bounds.size.w, h * 28 / 100));
   text_layer_set_background_color(s_edit_hint_layer, GColorClear);
-  text_layer_set_text_color(s_edit_hint_layer, PBL_IF_COLOR_ELSE(GColorLightGray, GColorDarkGray));
+  text_layer_set_text_color(s_edit_hint_layer, GColorFromRGB(64, 64, 64));
   text_layer_set_font(s_edit_hint_layer, fonts_get_system_font(FONT_KEY_GOTHIC_14));
   text_layer_set_text_alignment(s_edit_hint_layer, GTextAlignmentCenter);
   layer_add_child(window_layer, text_layer_get_layer(s_edit_hint_layer));
 
   s_edit_field = EFEnabled;
+  s_edit_scroll = 0;
   edit_update_text();
 }
 
 static void edit_window_unload(Window *window) {
-  text_layer_destroy(s_edit_big_layer);
-  text_layer_destroy(s_edit_summary_layer);
+  for (int i = 0; i < EDIT_VISIBLE_ROWS; i++) {
+    text_layer_destroy(s_edit_field_layers[i]);
+  }
   text_layer_destroy(s_edit_hint_layer);
 }
 
@@ -745,42 +968,65 @@ static void list_tick_handler(struct tm *tick_time, TimeUnits units_changed) {
   list_update_title();
 }
 
-static void list_update_text(void) {
-  static char body[256];
-  char days_buf[32];
-  size_t off = 0;
-
-  for (int i = 0; i < MAX_ALARMS && off < sizeof(body); i++) {
-    Alarm *a = &s_alarms[i];
-    const char *cursor = (s_list_cursor == i) ? ">" : " ";
-    if (a->enabled) {
-      format_days_summary(a->days_mask, days_buf, sizeof(days_buf));
-      off += snprintf(body + off, sizeof(body) - off, "%s %02d:%02d %s\n", cursor, a->hour, a->minute, days_buf);
-    } else {
-      off += snprintf(body + off, sizeof(body) - off, "%s -- off --\n", cursor);
-    }
+static void list_row_text(int i, char *out, size_t out_len) {
+  const char *prefix = (s_list_cursor == i) ? "> " : "";
+  if (i == 0) {
+    snprintf(out, out_len, "%sHR settings", prefix);
+    return;
   }
-  const char *settings_cursor = (s_list_cursor == MAX_ALARMS) ? ">" : " ";
-  snprintf(body + off, sizeof(body) - off, "%s HR settings", settings_cursor);
+  Alarm *a = &s_alarms[i - 1];
+  if (a->enabled) {
+    char days_buf[32];
+    format_days_summary(a->days_mask, days_buf, sizeof(days_buf));
+    snprintf(out, out_len, "%s%02d:%02d %s", prefix, a->hour, a->minute, days_buf);
+  } else {
+    snprintf(out, out_len, "%sAlarm off", prefix);
+  }
+}
 
-  text_layer_set_text(s_list_body_layer, body);
+static void list_update_text(void) {
+  static char row_text[LIST_WINDOW_ROWS][48];
+
+  for (int row = 0; row < LIST_WINDOW_ROWS; row++) {
+    int i = s_list_scroll + row;
+    bool active = (i == s_list_cursor);
+    list_row_text(i, row_text[row], sizeof(row_text[row]));
+    text_layer_set_text(s_list_row_layers[row], row_text[row]);
+    text_layer_set_font(s_list_row_layers[row], fonts_get_system_font(
+        active ? FONT_KEY_GOTHIC_24_BOLD : FONT_KEY_GOTHIC_24));
+    text_layer_set_text_color(s_list_row_layers[row], active
+        ? PBL_IF_COLOR_ELSE(GColorRed, GColorBlack)
+        : GColorFromRGB(64, 64, 64));
+  }
+}
+
+// keeps the cursor's row inside the visible window, scrolling as needed;
+// works for movement in either direction, including wraparound
+static void list_scroll_to_cursor(void) {
+  if (s_list_cursor < s_list_scroll) {
+    s_list_scroll = s_list_cursor;
+  } else if (s_list_cursor >= s_list_scroll + LIST_WINDOW_ROWS) {
+    s_list_scroll = s_list_cursor - LIST_WINDOW_ROWS + 1;
+  }
 }
 
 static void list_up_click_handler(ClickRecognizerRef recognizer, void *context) {
-  s_list_cursor = (s_list_cursor + MAX_ALARMS) % (MAX_ALARMS + 1);
+  s_list_cursor = (s_list_cursor + MAX_ALARMS) % LIST_TOTAL_ROWS;
+  list_scroll_to_cursor();
   list_update_text();
 }
 
 static void list_down_click_handler(ClickRecognizerRef recognizer, void *context) {
-  s_list_cursor = (s_list_cursor + 1) % (MAX_ALARMS + 1);
+  s_list_cursor = (s_list_cursor + 1) % LIST_TOTAL_ROWS;
+  list_scroll_to_cursor();
   list_update_text();
 }
 
 static void list_select_click_handler(ClickRecognizerRef recognizer, void *context) {
-  if (s_list_cursor == MAX_ALARMS) {
+  if (s_list_cursor == 0) {
     enter_settings_screen();
   } else {
-    enter_edit_screen(s_list_cursor);
+    enter_edit_screen(s_list_cursor - 1);
   }
 }
 
@@ -797,44 +1043,35 @@ static void list_click_config_provider(void *context) {
   window_long_click_subscribe(BUTTON_ID_SELECT, 700, list_select_long_click_handler, NULL);
 }
 
-static void accent_bar_draw_proc(Layer *layer, GContext *ctx) {
-  graphics_context_set_fill_color(ctx, PBL_IF_COLOR_ELSE(GColorElectricBlue, GColorBlack));
-  graphics_fill_rect(ctx, layer_get_bounds(layer), 0, GCornerNone);
-}
-
-static Layer *s_accent_bar_layer;
-
 static void list_window_load(Window *window) {
   Layer *window_layer = window_get_root_layer(window);
   GRect bounds = layer_get_bounds(window_layer);
+  int16_t h = bounds.size.h;
 
-  window_set_background_color(window, PBL_IF_COLOR_ELSE(GColorOxfordBlue, GColorWhite));
+  window_set_background_color(window, GColorWhite);
 
-  s_list_title_layer = text_layer_create(GRect(0, 10, bounds.size.w, 30));
+  s_list_title_layer = text_layer_create(GRect(0, h * 2 / 100, bounds.size.w, h * 14 / 100));
   text_layer_set_background_color(s_list_title_layer, GColorClear);
-  text_layer_set_text_color(s_list_title_layer, PBL_IF_COLOR_ELSE(GColorWhite, GColorBlack));
+  text_layer_set_text_color(s_list_title_layer, GColorBlack);
   text_layer_set_font(s_list_title_layer, fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD));
   text_layer_set_text_alignment(s_list_title_layer, GTextAlignmentCenter);
   layer_add_child(window_layer, text_layer_get_layer(s_list_title_layer));
   list_update_title();
 
-  s_accent_bar_layer = layer_create(GRect(bounds.size.w / 4, 44, bounds.size.w / 2, 3));
-  layer_set_update_proc(s_accent_bar_layer, accent_bar_draw_proc);
-  layer_add_child(window_layer, s_accent_bar_layer);
+  for (int i = 0; i < LIST_WINDOW_ROWS; i++) {
+    s_list_row_layers[i] = text_layer_create(
+        GRect(6, h * (16 + i * 16) / 100, bounds.size.w - 12, h * 16 / 100));
+    text_layer_set_background_color(s_list_row_layers[i], GColorClear);
+    text_layer_set_text_alignment(s_list_row_layers[i], GTextAlignmentLeft);
+    layer_add_child(window_layer, text_layer_get_layer(s_list_row_layers[i]));
+  }
 
-  s_list_body_layer = text_layer_create(GRect(0, 52, bounds.size.w, 110));
-  text_layer_set_background_color(s_list_body_layer, GColorClear);
-  text_layer_set_text_color(s_list_body_layer, PBL_IF_COLOR_ELSE(GColorElectricBlue, GColorBlack));
-  text_layer_set_font(s_list_body_layer, fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD));
-  text_layer_set_text_alignment(s_list_body_layer, GTextAlignmentLeft);
-  layer_add_child(window_layer, text_layer_get_layer(s_list_body_layer));
-
-  s_list_hint_layer = text_layer_create(GRect(0, bounds.size.h - 50, bounds.size.w, 50));
+  s_list_hint_layer = text_layer_create(GRect(0, h * 72 / 100, bounds.size.w, h * 28 / 100));
   text_layer_set_background_color(s_list_hint_layer, GColorClear);
-  text_layer_set_text_color(s_list_hint_layer, PBL_IF_COLOR_ELSE(GColorLightGray, GColorDarkGray));
+  text_layer_set_text_color(s_list_hint_layer, GColorFromRGB(64, 64, 64));
   text_layer_set_font(s_list_hint_layer, fonts_get_system_font(FONT_KEY_GOTHIC_14));
   text_layer_set_text_alignment(s_list_hint_layer, GTextAlignmentCenter);
-  text_layer_set_text(s_list_hint_layer, "SELECT: edit  hold SELECT: test now");
+  text_layer_set_text(s_list_hint_layer, "UP/DOWN: move cursor\nSELECT: edit\nhold SELECT: test now");
   layer_add_child(window_layer, text_layer_get_layer(s_list_hint_layer));
 
   list_update_text();
@@ -842,8 +1079,9 @@ static void list_window_load(Window *window) {
 
 static void list_window_unload(Window *window) {
   text_layer_destroy(s_list_title_layer);
-  layer_destroy(s_accent_bar_layer);
-  text_layer_destroy(s_list_body_layer);
+  for (int i = 0; i < LIST_WINDOW_ROWS; i++) {
+    text_layer_destroy(s_list_row_layers[i]);
+  }
   text_layer_destroy(s_list_hint_layer);
 }
 
