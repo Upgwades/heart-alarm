@@ -5,10 +5,11 @@
 #define DEFAULT_SUSTAIN_SECS 10
 #define DEFAULT_GRACE_SECS 20
 #define GRACE_BUZZ_INTERVAL_SECS 4  // buzz every N seconds during grace, not every tick
+#define CALIBRATION_MAX_SECS 90  // safeguard cap if the watch never gets a fresh HR sample (e.g. not worn)
 #define HR_SAMPLE_PERIOD_SEC 1
 #define TICK_MS 1000
 #define ALARM_VOLUME 100
-#define MAX_ALARMS 5
+#define MAX_ALARMS 20  // generous ceiling for the persisted array, not a user-facing limit
 
 typedef enum {
   AlarmPhaseGrace,        // a few buzzes to rouse the wearer before we start reading HR
@@ -16,32 +17,57 @@ typedef enum {
   AlarmPhaseActive,       // normal threshold/sustain logic
 } AlarmPhase;
 
+// Repeat: fires every selected weekday, forever. Once: fires next, then
+// disables itself (paused, not removed). Temporary: fires next, then is
+// deleted outright. None of this applies to a manual "Test now" run.
+typedef enum { AlarmRepeat, AlarmOnce, AlarmTemporary } AlarmType;
+
 // one persisted alarm slot. days_mask bit i corresponds to struct tm's
-// tm_wday (0=Sunday .. 6=Saturday); a mask of 0 means "next occurrence only,
-// don't repeat".
+// tm_wday (0=Sunday .. 6=Saturday); at least one bit is always set (enforced
+// at edit time - an alarm with no days selected can never fire). HR
+// target/sustain/grace are per-alarm, not global, so each alarm can have its
+// own wake-up-difficulty profile.
 typedef struct {
   bool enabled;
   uint8_t hour;
   uint8_t minute;
   uint8_t days_mask;
   int32_t wakeup_id;  // -1 if nothing currently scheduled
+  int16_t target_bpm;
+  int16_t sustain_secs;
+  int16_t grace_secs;
+  int8_t alarm_type;  // AlarmType
 } Alarm;
 
 static Alarm s_alarms[MAX_ALARMS];
-static int s_active_alarm_index = -1;  // which alarm fired the current alarm session, -1 = manual test
+static int s_alarm_count = 0;  // number of alarms actually in use (s_alarms[0..count-1])
+static int s_active_alarm_index = 0;  // which alarm is running the current alarm session
+// true when the current alarm session was started via "Test now" rather than
+// a real trigger (wakeup or resumed session) - once/temporary side effects
+// and any other "real trigger only" behavior must check this first
+static bool s_alarm_is_test = false;
 
-#define LIST_TOTAL_ROWS (MAX_ALARMS + 1)
 #define LIST_WINDOW_ROWS 3
 
 static Window *s_list_window;
 static TextLayer *s_list_title_layer;
 static TextLayer *s_list_row_layers[LIST_WINDOW_ROWS];
+static TextLayer *s_list_type_layers[LIST_WINDOW_ROWS];
+static Layer *s_list_day_layers[LIST_WINDOW_ROWS];
+// column widths/geometry computed once in list_window_load, reused in
+// list_update_text to widen row 0's text layer to the full row width (its
+// "+ Add alarm" label has nowhere near a real alarm's other two columns)
+static int16_t s_list_row_w, s_list_time_w;
 static TextLayer *s_list_hint_layer;
-static int s_list_cursor = 0;  // 0 = "HR settings" row, 1..MAX_ALARMS = alarm rows
+static int s_list_cursor = 0;  // 0 = "+ Add alarm" row, 1..count = alarm rows
 static int s_list_scroll = 0;  // index of the item shown in the topmost visible row
 
+// EFEnabled/day fields are toggles; EFHour/EFMinute/EFTargetBpm/EFSustainSecs/
+// EFGraceSecs are numeric (SELECT enters adjust mode, see s_edit_adjusting);
+// EFTestNow/EFDelete are one-shot actions.
 typedef enum {
-  EFEnabled, EFHour, EFMinute, EFSun, EFMon, EFTue, EFWed, EFThu, EFFri, EFSat, EFCount,
+  EFEnabled, EFAlarmType, EFHour, EFMinute, EFTargetBpm, EFSustainSecs, EFGraceSecs,
+  EFSun, EFMon, EFTue, EFWed, EFThu, EFFri, EFSat, EFTestNow, EFDelete, EFCount,
 } EditField;
 
 #define EDIT_VISIBLE_ROWS 4
@@ -52,15 +78,10 @@ static TextLayer *s_edit_hint_layer;
 static int s_editing_alarm_index = -1;
 static EditField s_edit_field = EFEnabled;
 static int s_edit_scroll = 0;  // index of the field shown in the topmost visible row
-
-typedef enum {
-  FieldTargetBpm, FieldSustainSecs, FieldGraceSecs, FieldCount,
-} SettingField;
-
-static Window *s_settings_window;
-static TextLayer *s_settings_field_layers[FieldCount];
-static TextLayer *s_settings_hint_layer;
-static SettingField s_active_field = FieldTargetBpm;
+// UP/DOWN always move the cursor between rows, EXCEPT while adjusting a
+// numeric field's value (entered/exited via SELECT) - one consistent model
+// instead of mixing "SELECT tabs / UP+DOWN adjusts" with action rows
+static bool s_edit_adjusting = false;
 
 static Window *s_alarm_window;
 static TextLayer *s_alarm_bpm_layer;
@@ -97,34 +118,53 @@ static void health_event_handler(HealthEventType event, void *context) {
 
 // ---------- persistence ----------
 enum {
-  PKEY_TARGET_BPM = 100,
-  PKEY_SUSTAIN_SECS = 101,
-  PKEY_GRACE_SECS = 105,
+  PKEY_ALARM_COUNT = 100,
   PKEY_ALARMS = 110,
+  PKEY_SESSION_ACTIVE = 111,
+  PKEY_SESSION_ALARM_IDX = 112,
+  PKEY_SESSION_IS_TEST = 113,
 };
 
-static void load_settings(void) {
-  if (persist_exists(PKEY_TARGET_BPM)) s_target_bpm = persist_read_int(PKEY_TARGET_BPM);
-  if (persist_exists(PKEY_SUSTAIN_SECS)) s_sustain_secs = persist_read_int(PKEY_SUSTAIN_SECS);
-  if (persist_exists(PKEY_GRACE_SECS)) s_grace_secs = persist_read_int(PKEY_GRACE_SECS);
+// long-pressing BACK is a system-level "quit app" gesture that no watchapp
+// can intercept, so instead of trying to block the escape, we make it
+// pointless: persist that an alarm session is in progress, and on the next
+// launch (from the launcher, not just a wakeup event) resume straight back
+// into the locked alarm screen rather than the main list
+static void persist_session_active(int alarm_index, bool is_test) {
+  persist_write_int(PKEY_SESSION_ACTIVE, 1);
+  persist_write_int(PKEY_SESSION_ALARM_IDX, alarm_index);
+  persist_write_int(PKEY_SESSION_IS_TEST, is_test ? 1 : 0);
+  // the worker polls this same flag and force-relaunches the app onto the
+  // locked alarm screen if it ever gets quit (e.g. the unblockable long-BACK
+  // gesture) - vibration would otherwise die the instant the app closes
+  app_worker_launch();
+}
 
-  if (persist_exists(PKEY_ALARMS)) {
-    persist_read_data(PKEY_ALARMS, s_alarms, sizeof(s_alarms));
-  } else {
-    for (int i = 0; i < MAX_ALARMS; i++) {
-      s_alarms[i] = (Alarm){ .enabled = false, .hour = 7, .minute = 0, .days_mask = 0, .wakeup_id = -1 };
-    }
+static void persist_session_cleared(void) {
+  persist_write_int(PKEY_SESSION_ACTIVE, 0);
+  if (app_worker_is_running()) {
+    app_worker_kill();
   }
 }
 
-static void save_settings(void) {
-  persist_write_int(PKEY_TARGET_BPM, s_target_bpm);
-  persist_write_int(PKEY_SUSTAIN_SECS, s_sustain_secs);
-  persist_write_int(PKEY_GRACE_SECS, s_grace_secs);
+static void load_settings(void) {
+  if (!persist_exists(PKEY_ALARM_COUNT)) {
+    s_alarm_count = 0;
+    return;
+  }
+  s_alarm_count = persist_read_int(PKEY_ALARM_COUNT);
+  if (s_alarm_count < 0) s_alarm_count = 0;
+  if (s_alarm_count > MAX_ALARMS) s_alarm_count = MAX_ALARMS;
+  if (s_alarm_count > 0 && persist_exists(PKEY_ALARMS)) {
+    persist_read_data(PKEY_ALARMS, s_alarms, s_alarm_count * sizeof(Alarm));
+  }
 }
 
 static void save_alarms(void) {
-  persist_write_data(PKEY_ALARMS, s_alarms, sizeof(s_alarms));
+  persist_write_int(PKEY_ALARM_COUNT, s_alarm_count);
+  if (s_alarm_count > 0) {
+    persist_write_data(PKEY_ALARMS, s_alarms, s_alarm_count * sizeof(Alarm));
+  }
 }
 
 // ---------- alarm scheduling ----------
@@ -171,7 +211,7 @@ static void schedule_alarm_index(int idx) {
 }
 
 static void reschedule_all_enabled(void) {
-  for (int i = 0; i < MAX_ALARMS; i++) {
+  for (int i = 0; i < s_alarm_count; i++) {
     Alarm *a = &s_alarms[i];
     if (a->enabled && (a->wakeup_id < 0 || !wakeup_query(a->wakeup_id, NULL))) {
       schedule_alarm_index(i);
@@ -179,20 +219,22 @@ static void reschedule_all_enabled(void) {
   }
 }
 
-static void format_days_summary(uint8_t mask, char *buf, size_t n) {
-  static const char *const names[7] = { "Su", "Mo", "Tu", "We", "Th", "Fr", "Sa" };
-  if (mask == 0) {
-    snprintf(buf, n, "Once");
-  } else if (mask == 0x7F) {
-    snprintf(buf, n, "Daily");
-  } else {
-    buf[0] = '\0';
-    for (int i = 0; i < 7; i++) {
-      if (mask & (1 << i)) {
-        if (buf[0] != '\0') strncat(buf, " ", n - strlen(buf) - 1);
-        strncat(buf, names[i], n - strlen(buf) - 1);
-      }
-    }
+// removes alarm idx from the array outright, cancels its pending wakeup, and
+// re-schedules every alarm that shifted down a slot (wakeup_schedule() bakes
+// the array index in as its "reason", so a shift leaves other alarms'
+// already-scheduled wakeups pointing at a stale index otherwise)
+static void delete_alarm_at(int idx) {
+  Alarm *a = &s_alarms[idx];
+  if (a->wakeup_id >= 0 && wakeup_query(a->wakeup_id, NULL)) {
+    wakeup_cancel(a->wakeup_id);
+  }
+  for (int i = idx; i < s_alarm_count - 1; i++) {
+    s_alarms[i] = s_alarms[i + 1];
+  }
+  s_alarm_count--;
+  save_alarms();
+  for (int i = idx; i < s_alarm_count; i++) {
+    schedule_alarm_index(i);
   }
 }
 
@@ -321,7 +363,7 @@ static void heart_pulse_tick(void *data) {
   if (s_heart_layer) {
     layer_mark_dirty(s_heart_layer);
   }
-  s_heart_timer = app_timer_register(180, heart_pulse_tick, NULL);
+  s_heart_timer = app_timer_register(80, heart_pulse_tick, NULL);
 }
 
 // pulses the heart layer `pulse_count` full cycles, then calls done_cb (may
@@ -331,7 +373,7 @@ static void heart_pulse_start(int pulse_count, void (*done_cb)(void)) {
   s_heart_pulses_remaining = pulse_count;
   s_heart_pulse_done_cb = done_cb;
   if (!s_heart_timer) {
-    s_heart_timer = app_timer_register(180, heart_pulse_tick, NULL);
+    s_heart_timer = app_timer_register(80, heart_pulse_tick, NULL);
   }
 }
 
@@ -344,7 +386,7 @@ static void heart_pulse_stop(void) {
 }
 
 // ---------- celebration window (own screen, auto-dismisses) ----------
-#define CELEBRATION_PULSE_COUNT 3
+#define CELEBRATION_PULSE_COUNT 5
 
 static Window *s_celebration_window;
 static TextLayer *s_celebration_status_layer;
@@ -361,17 +403,28 @@ static void finish_alarm_session(void) {
   speaker_stop();
   s_alarm_active = false;
   health_service_set_heart_rate_sample_period(0);
+  persist_session_cleared();
 
-  if (s_active_alarm_index >= 0) {
-    // this alarm was a real scheduled one, not a manual test: line up its
-    // next occurrence per its day-of-week repeat mask
-    schedule_alarm_index(s_active_alarm_index);
-    s_active_alarm_index = -1;
+  // once/temporary side effects only apply to a real trigger, never to a
+  // manual "Test now" run
+  if (!s_alarm_is_test) {
+    Alarm *a = &s_alarms[s_active_alarm_index];
+    if (a->alarm_type == AlarmTemporary) {
+      delete_alarm_at(s_active_alarm_index);
+      return;
+    } else if (a->alarm_type == AlarmOnce) {
+      a->enabled = false;
+      save_alarms();
+      schedule_alarm_index(s_active_alarm_index);  // cancels the wakeup since now disabled
+      return;
+    }
   }
+  schedule_alarm_index(s_active_alarm_index);
 }
 
 static void celebration_finish(void) {
   heart_pulse_stop();
+  light_enable(false);  // screen stays lit through the celebration too, only now released
   window_stack_pop(true);
 }
 
@@ -572,6 +625,10 @@ static void alarm_tick(void *data) {
     }
     s_grace_elapsed_secs++;
     if (s_grace_elapsed_secs >= s_grace_secs) {
+      // the grace buzz pattern can still be mid-playback when this phase
+      // ends; cut it off immediately instead of letting it bleed into
+      // calibrating
+      vibes_cancel();
       s_phase = AlarmPhaseCalibrating;
       s_calibration_elapsed_secs = 0;
     }
@@ -584,8 +641,10 @@ static void alarm_tick(void *data) {
     s_calibration_elapsed_secs++;
     // gated purely on a confirmed-fresh HR sample: peek_current_value can
     // keep returning a stale pre-alarm reading for an unpredictable amount
-    // of time, so there's no fixed delay that reliably guarantees a real one
-    if (s_fresh_hr_events >= 1) {
+    // of time, so there's no fixed delay that reliably guarantees a real one.
+    // CALIBRATION_MAX_SECS is just a safeguard against never getting one at
+    // all (e.g. the watch isn't being worn) - not a configurable setting.
+    if (s_fresh_hr_events >= 1 || s_calibration_elapsed_secs >= CALIBRATION_MAX_SECS) {
       s_phase = AlarmPhaseActive;
     }
   }
@@ -639,6 +698,11 @@ static void alarm_back_click_handler(ClickRecognizerRef recognizer, void *contex
 static void alarm_click_config_provider(void *context) {
   window_single_click_subscribe(BUTTON_ID_SELECT, alarm_select_click_handler);
   window_single_click_subscribe(BUTTON_ID_BACK, alarm_back_click_handler);
+  // holding BACK is a system-level "quit app" gesture that bypasses normal
+  // click handling entirely unless a long-click handler for BACK is
+  // subscribed to override it; without this, a held BACK could still escape
+  // the alarm even with the single-click handler above swallowing short presses
+  window_long_click_subscribe(BUTTON_ID_BACK, 0, alarm_back_click_handler, NULL);
 }
 
 static void alarm_window_load(Window *window) {
@@ -668,13 +732,23 @@ static void alarm_window_load(Window *window) {
   text_layer_set_text_alignment(s_alarm_progress_layer, GTextAlignmentCenter);
   layer_add_child(window_layer, text_layer_get_layer(s_alarm_progress_layer));
 
+  // snapshot this specific alarm's HR settings for the duration of the
+  // session - s_target_bpm/s_sustain_secs/s_grace_secs below are a
+  // session-scoped cache, not global settings
+  Alarm *active = &s_alarms[s_active_alarm_index];
+  s_target_bpm = active->target_bpm;
+  s_sustain_secs = active->sustain_secs;
+  s_grace_secs = active->grace_secs;
+
   vibes_cancel();
   speaker_stop();
+  light_enable(true);  // keep the screen lit for the whole alarm phase
   health_service_set_heart_rate_sample_period(HR_SAMPLE_PERIOD_SEC);
   s_sustained_seconds = 0;
   s_elapsed_seconds = 0;
   s_fresh_hr_events = 0;
   s_alarm_active = true;
+  persist_session_active(s_active_alarm_index, s_alarm_is_test);
   s_phase = AlarmPhaseGrace;
   s_grace_elapsed_secs = 0;
   s_calibration_elapsed_secs = 0;
@@ -696,6 +770,13 @@ static void alarm_window_unload(Window *window) {
   speaker_stop();
   s_alarm_active = false;
   health_service_set_heart_rate_sample_period(0);
+  // deliberately NOT calling light_enable(false) or clearing the persisted
+  // session flag here: this handler also runs on the normal success path
+  // (window popped to enter the celebration screen), where the backlight
+  // needs to stay on (celebration_finish() releases it) and the resume flag
+  // must survive (it also runs during an app quit via the unblockable
+  // long-BACK gesture). Both are only cleared on their true end-of-session
+  // paths: celebration_finish() and finish_alarm_session() respectively.
   layer_destroy(s_alarm_progress_bar_layer);
   text_layer_destroy(s_alarm_bpm_layer);
   text_layer_destroy(s_alarm_status_layer);
@@ -712,117 +793,18 @@ static void enter_alarm_mode(void) {
   window_stack_push(s_alarm_window, true);
 }
 
-// ---------- HR settings window (shared across all alarms) ----------
-static void settings_update_text(void) {
-  static char field_text[FieldCount][40];
-
-  snprintf(field_text[FieldTargetBpm], sizeof(field_text[FieldTargetBpm]),
-           "%sTarget: %d bpm", s_active_field == FieldTargetBpm ? "> " : "", s_target_bpm);
-  snprintf(field_text[FieldSustainSecs], sizeof(field_text[FieldSustainSecs]),
-           "%sSustain: %d seconds", s_active_field == FieldSustainSecs ? "> " : "", s_sustain_secs);
-  snprintf(field_text[FieldGraceSecs], sizeof(field_text[FieldGraceSecs]),
-           "%sGrace: %d seconds", s_active_field == FieldGraceSecs ? "> " : "", s_grace_secs);
-
-  for (int i = 0; i < FieldCount; i++) {
-    bool active = (i == s_active_field);
-    text_layer_set_text(s_settings_field_layers[i], field_text[i]);
-    text_layer_set_font(s_settings_field_layers[i], fonts_get_system_font(
-        active ? FONT_KEY_GOTHIC_24_BOLD : FONT_KEY_GOTHIC_24));
-    text_layer_set_text_color(s_settings_field_layers[i], active
-        ? PBL_IF_COLOR_ELSE(GColorRed, GColorBlack)
-        : GColorFromRGB(64, 64, 64));
-  }
-
-  static char hint[80];
-  snprintf(hint, sizeof(hint), "UP/DOWN: change\nSELECT: next field\nhold SELECT: save & exit");
-  text_layer_set_text(s_settings_hint_layer, hint);
-}
-
-static void settings_up_click_handler(ClickRecognizerRef recognizer, void *context) {
-  switch (s_active_field) {
-    case FieldTargetBpm: s_target_bpm += 5; break;
-    case FieldSustainSecs: s_sustain_secs += 5; break;
-    default: s_grace_secs += 5; break;
-  }
-  save_settings();
-  settings_update_text();
-}
-
-static void settings_down_click_handler(ClickRecognizerRef recognizer, void *context) {
-  switch (s_active_field) {
-    case FieldTargetBpm: if (s_target_bpm > 40) s_target_bpm -= 5; break;
-    case FieldSustainSecs: if (s_sustain_secs > 5) s_sustain_secs -= 5; break;
-    default: if (s_grace_secs > 5) s_grace_secs -= 5; break;
-  }
-  save_settings();
-  settings_update_text();
-}
-
-static void settings_select_click_handler(ClickRecognizerRef recognizer, void *context) {
-  s_active_field = (s_active_field + 1) % FieldCount;
-  settings_update_text();
-}
-
-static void settings_select_long_click_handler(ClickRecognizerRef recognizer, void *context) {
-  // long-press SELECT: done editing, save and go back to the alarm list
-  save_settings();
-  window_stack_pop(true);
-}
-
-static void settings_click_config_provider(void *context) {
-  window_single_click_subscribe(BUTTON_ID_UP, settings_up_click_handler);
-  window_single_click_subscribe(BUTTON_ID_DOWN, settings_down_click_handler);
-  window_single_click_subscribe(BUTTON_ID_SELECT, settings_select_click_handler);
-  window_long_click_subscribe(BUTTON_ID_SELECT, 700, settings_select_long_click_handler, NULL);
-}
-
-static void settings_window_load(Window *window) {
-  Layer *window_layer = window_get_root_layer(window);
-  GRect bounds = layer_get_bounds(window_layer);
-  int16_t h = bounds.size.h;
-
-  window_set_background_color(window, GColorWhite);
-
-  for (int i = 0; i < FieldCount; i++) {
-    s_settings_field_layers[i] = text_layer_create(
-        GRect(6, h * (6 + i * 16) / 100, bounds.size.w - 12, h * 16 / 100));
-    text_layer_set_background_color(s_settings_field_layers[i], GColorClear);
-    text_layer_set_text_alignment(s_settings_field_layers[i], GTextAlignmentLeft);
-    layer_add_child(window_layer, text_layer_get_layer(s_settings_field_layers[i]));
-  }
-
-  s_settings_hint_layer = text_layer_create(GRect(0, h * 72 / 100, bounds.size.w, h * 28 / 100));
-  text_layer_set_background_color(s_settings_hint_layer, GColorClear);
-  text_layer_set_text_color(s_settings_hint_layer, GColorFromRGB(64, 64, 64));
-  text_layer_set_font(s_settings_hint_layer, fonts_get_system_font(FONT_KEY_GOTHIC_14));
-  text_layer_set_text_alignment(s_settings_hint_layer, GTextAlignmentCenter);
-  layer_add_child(window_layer, text_layer_get_layer(s_settings_hint_layer));
-
-  settings_update_text();
-}
-
-static void settings_window_unload(Window *window) {
-  for (int i = 0; i < FieldCount; i++) {
-    text_layer_destroy(s_settings_field_layers[i]);
-  }
-  text_layer_destroy(s_settings_hint_layer);
-}
-
-static void enter_settings_screen(void) {
-  s_active_field = FieldTargetBpm;
-  s_settings_window = window_create();
-  window_set_click_config_provider(s_settings_window, settings_click_config_provider);
-  window_set_window_handlers(s_settings_window, (WindowHandlers) {
-    .load = settings_window_load,
-    .unload = settings_window_unload,
-  });
-  window_stack_push(s_settings_window, true);
-}
-
-// ---------- per-alarm edit window ----------
+// ---------- per-alarm edit window (fields + inline HR settings + actions) ----------
 static const char *const kEditFieldLabels[EFCount] = {
-  "Enabled", "Hour", "Minute", "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
+  "Enabled", "Type", "Hour", "Minute", "Target", "Sustain", "Grace",
+  "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
+  "Test now", "Delete alarm",
 };
+
+static const char *const kAlarmTypeLabels[3] = { "Repeat", "Once", "Temporary" };
+
+static bool edit_field_is_numeric(EditField f) {
+  return f == EFHour || f == EFMinute || f == EFTargetBpm || f == EFSustainSecs || f == EFGraceSecs;
+}
 
 static void edit_field_text(int i, char *out, size_t out_len) {
   Alarm *a = &s_alarms[s_editing_alarm_index];
@@ -831,12 +813,23 @@ static void edit_field_text(int i, char *out, size_t out_len) {
     snprintf(out, out_len, "%s%s: %02d", prefix, kEditFieldLabels[i], a->hour);
   } else if (i == EFMinute) {
     snprintf(out, out_len, "%s%s: %02d", prefix, kEditFieldLabels[i], a->minute);
+  } else if (i == EFTargetBpm) {
+    snprintf(out, out_len, "%s%s: %d bpm", prefix, kEditFieldLabels[i], a->target_bpm);
+  } else if (i == EFSustainSecs) {
+    snprintf(out, out_len, "%s%s: %d sec", prefix, kEditFieldLabels[i], a->sustain_secs);
+  } else if (i == EFGraceSecs) {
+    snprintf(out, out_len, "%s%s: %d sec", prefix, kEditFieldLabels[i], a->grace_secs);
+  } else if (i == EFAlarmType) {
+    snprintf(out, out_len, "%s%s: %s", prefix, kEditFieldLabels[i], kAlarmTypeLabels[a->alarm_type]);
   } else if (i == EFEnabled) {
     snprintf(out, out_len, "%s%s: %s", prefix, kEditFieldLabels[i], a->enabled ? "On" : "Off");
-  } else {
+  } else if (i >= EFSun && i <= EFSat) {
     int day = i - EFSun;
     snprintf(out, out_len, "%s%s: %s", prefix, kEditFieldLabels[i],
              (a->days_mask & (1 << day)) ? "On" : "Off");
+  } else {
+    // action rows (Test now/Delete alarm): just the label, no value
+    snprintf(out, out_len, "%s%s", prefix, kEditFieldLabels[i]);
   }
 }
 
@@ -855,7 +848,11 @@ static void edit_update_text(void) {
         : GColorFromRGB(64, 64, 64));
   }
 
-  text_layer_set_text(s_edit_hint_layer, "UP/DOWN: change\nSELECT: next field\nhold SELECT: save & exit");
+  if (s_edit_adjusting) {
+    text_layer_set_text(s_edit_hint_layer, "UP/DOWN: change value\nSELECT: done");
+  } else {
+    text_layer_set_text(s_edit_hint_layer, "UP/DOWN: move\nSELECT: choose\nhold SELECT: save & exit");
+  }
 }
 
 static void edit_apply_and_reschedule(void) {
@@ -864,36 +861,113 @@ static void edit_apply_and_reschedule(void) {
   edit_update_text();
 }
 
-static void edit_up_click_handler(ClickRecognizerRef recognizer, void *context) {
-  Alarm *a = &s_alarms[s_editing_alarm_index];
-  switch (s_edit_field) {
-    case EFEnabled: a->enabled = !a->enabled; break;
-    case EFHour: a->hour = (a->hour + 1) % 24; break;
-    case EFMinute: a->minute = (a->minute + 5) % 60; break;
-    default: a->days_mask ^= (1 << (s_edit_field - EFSun)); break;
-  }
-  edit_apply_and_reschedule();
-}
-
-static void edit_down_click_handler(ClickRecognizerRef recognizer, void *context) {
-  Alarm *a = &s_alarms[s_editing_alarm_index];
-  switch (s_edit_field) {
-    case EFEnabled: a->enabled = !a->enabled; break;
-    case EFHour: a->hour = (a->hour + 23) % 24; break;
-    case EFMinute: a->minute = (a->minute + 55) % 60; break;
-    default: a->days_mask ^= (1 << (s_edit_field - EFSun)); break;
-  }
-  edit_apply_and_reschedule();
-}
-
-static void edit_select_click_handler(ClickRecognizerRef recognizer, void *context) {
-  s_edit_field = (s_edit_field + 1) % EFCount;
-  if (s_edit_field == 0) {
-    s_edit_scroll = 0;  // wrapped back to the first field: scroll back to top
+// UP/DOWN always move the cursor between rows, except while s_edit_adjusting
+// is set (a numeric field's value is being changed instead)
+static void edit_move_cursor(int delta) {
+  s_edit_field = (EditField)(((int)s_edit_field + delta + EFCount) % EFCount);
+  if (s_edit_field < s_edit_scroll) {
+    s_edit_scroll = s_edit_field;
   } else if (s_edit_field >= s_edit_scroll + EDIT_VISIBLE_ROWS) {
     s_edit_scroll = s_edit_field - EDIT_VISIBLE_ROWS + 1;
   }
   edit_update_text();
+}
+
+static void edit_adjust_value(int delta) {
+  Alarm *a = &s_alarms[s_editing_alarm_index];
+  switch (s_edit_field) {
+    case EFHour: a->hour = (a->hour + 24 + delta) % 24; break;
+    case EFMinute: a->minute = (a->minute + 60 + delta) % 60; break;
+    case EFTargetBpm:
+      a->target_bpm += delta * 5;
+      if (a->target_bpm < 40) a->target_bpm = 40;
+      if (a->target_bpm > 220) a->target_bpm = 220;  // well past any real max heart rate
+      break;
+    case EFSustainSecs:
+      a->sustain_secs += delta * 5;
+      if (a->sustain_secs < 5) a->sustain_secs = 5;
+      break;
+    case EFGraceSecs:
+      a->grace_secs += delta * 5;
+      if (a->grace_secs < 5) a->grace_secs = 5;
+      break;
+    default: return;
+  }
+  edit_apply_and_reschedule();
+}
+
+static void edit_up_click_handler(ClickRecognizerRef recognizer, void *context) {
+  if (s_edit_adjusting) {
+    edit_adjust_value(1);
+  } else {
+    edit_move_cursor(-1);
+  }
+}
+
+static void edit_down_click_handler(ClickRecognizerRef recognizer, void *context) {
+  if (s_edit_adjusting) {
+    edit_adjust_value(-1);
+  } else {
+    edit_move_cursor(1);
+  }
+}
+
+// removes the alarm being edited from the list entirely (not just disables
+// it), cancels any pending wakeup for it, and returns to the alarm list
+static void delete_current_alarm(void) {
+  delete_alarm_at(s_editing_alarm_index);
+  if (s_list_cursor > s_alarm_count) {
+    s_list_cursor = s_alarm_count;
+  }
+  window_stack_pop(true);
+}
+
+static void edit_select_click_handler(ClickRecognizerRef recognizer, void *context) {
+  if (s_edit_adjusting) {
+    s_edit_adjusting = false;  // commit and return to navigation
+    edit_update_text();
+    return;
+  }
+  if (s_edit_field == EFTestNow) {
+    s_active_alarm_index = s_editing_alarm_index;
+    s_alarm_is_test = true;
+    enter_alarm_mode();
+    return;
+  }
+  if (s_edit_field == EFDelete) {
+    delete_current_alarm();
+    return;
+  }
+  if (s_edit_field == EFAlarmType) {
+    Alarm *a = &s_alarms[s_editing_alarm_index];
+    a->alarm_type = (a->alarm_type + 1) % 3;
+    edit_apply_and_reschedule();
+    return;
+  }
+  if (edit_field_is_numeric(s_edit_field)) {
+    s_edit_adjusting = true;  // UP/DOWN now change this field's value instead of moving the cursor
+    edit_update_text();
+    return;
+  }
+  // toggle fields (enabled/days): a plain SELECT flips it right away, no
+  // separate adjust mode needed for a binary value
+  Alarm *a = &s_alarms[s_editing_alarm_index];
+  if (s_edit_field == EFEnabled) {
+    a->enabled = !a->enabled;
+  } else {
+    int day = s_edit_field - EFSun;
+    bool day_on = a->days_mask & (1 << day);
+    int days_selected = 0;
+    for (int d = 0; d < 7; d++) {
+      if (a->days_mask & (1 << d)) days_selected++;
+    }
+    // at least one day must always stay selected, otherwise the alarm could
+    // never fire
+    if (!(day_on && days_selected <= 1)) {
+      a->days_mask ^= (1 << day);
+    }
+  }
+  edit_apply_and_reschedule();
 }
 
 static void edit_select_long_click_handler(ClickRecognizerRef recognizer, void *context) {
@@ -904,8 +978,8 @@ static void edit_select_long_click_handler(ClickRecognizerRef recognizer, void *
 }
 
 static void edit_click_config_provider(void *context) {
-  window_single_click_subscribe(BUTTON_ID_UP, edit_up_click_handler);
-  window_single_click_subscribe(BUTTON_ID_DOWN, edit_down_click_handler);
+  window_single_repeating_click_subscribe(BUTTON_ID_UP, 150, edit_up_click_handler);
+  window_single_repeating_click_subscribe(BUTTON_ID_DOWN, 150, edit_down_click_handler);
   window_single_click_subscribe(BUTTON_ID_SELECT, edit_select_click_handler);
   window_long_click_subscribe(BUTTON_ID_SELECT, 700, edit_select_long_click_handler, NULL);
 }
@@ -934,6 +1008,7 @@ static void edit_window_load(Window *window) {
 
   s_edit_field = EFEnabled;
   s_edit_scroll = 0;
+  s_edit_adjusting = false;
   edit_update_text();
 }
 
@@ -969,23 +1044,76 @@ static void list_tick_handler(struct tm *tick_time, TimeUnits units_changed) {
 }
 
 static void list_row_text(int i, char *out, size_t out_len) {
-  const char *prefix = (s_list_cursor == i) ? "> " : "";
+  // the cursor row is already indicated by bold+accent color (see
+  // list_update_text), so no "> " text prefix is needed here - that also
+  // frees up column width for the type indicator below
   if (i == 0) {
-    snprintf(out, out_len, "%sHR settings", prefix);
+    snprintf(out, out_len, "+ Add alarm");
+    return;
+  }
+  if (i > s_alarm_count) {
+    out[0] = '\0';  // beyond the real list (visible-window padding row): blank
     return;
   }
   Alarm *a = &s_alarms[i - 1];
   if (a->enabled) {
-    char days_buf[32];
-    format_days_summary(a->days_mask, days_buf, sizeof(days_buf));
-    snprintf(out, out_len, "%s%02d:%02d %s", prefix, a->hour, a->minute, days_buf);
+    snprintf(out, out_len, "%02d:%02d", a->hour, a->minute);
   } else {
-    snprintf(out, out_len, "%sAlarm off", prefix);
+    snprintf(out, out_len, "Alarm off");
   }
+}
+
+// draws the day-of-week grid for one alarm row: each of the 7 day letters
+// gets its own evenly-spaced cell (real spacing, not just adjacent glyphs),
+// and a selected day is bold + the accent color while an unselected one is
+// plain + dim - a real visual on/off distinction, not just letter case
+static void list_day_grid_draw_proc(Layer *layer, GContext *ctx) {
+  int row = *(int *)layer_get_data(layer);
+  int i = s_list_scroll + row;
+  if (i == 0 || i > s_alarm_count) return;
+
+  Alarm *a = &s_alarms[i - 1];
+  if (!a->enabled) return;
+
+  GRect bounds = layer_get_bounds(layer);
+  GFont font_on = fonts_get_system_font(FONT_KEY_GOTHIC_24_BOLD);
+  GFont font_off = fonts_get_system_font(FONT_KEY_GOTHIC_24);
+  GColor on_color = PBL_IF_COLOR_ELSE(GColorRed, GColorBlack);
+  GColor off_color = GColorFromRGB(64, 64, 64);
+
+  // always show the letter grid - a selected day is bold+accent, an
+  // unselected one plain+dim, regardless of how many days are picked
+  static const char *const letters[7] = { "S", "M", "T", "W", "T", "F", "S" };
+  int16_t pitch = bounds.size.w / 7;
+  for (int d = 0; d < 7; d++) {
+    bool on = a->days_mask & (1 << d);
+    graphics_context_set_text_color(ctx, on ? on_color : off_color);
+    GRect cell = GRect(bounds.origin.x + d * pitch, bounds.origin.y, pitch, bounds.size.h);
+    graphics_draw_text(ctx, letters[d], on ? font_on : font_off, cell,
+        GTextOverflowModeFill, GTextAlignmentCenter, NULL);
+  }
+}
+
+// repeat/once/temporary indicator text for one row - kept as its own small
+// TextLayer (not part of the day-letter grid) so it reads as a distinct
+// piece of info rather than an 8th day
+static void list_type_text(int i, char *out, size_t out_len) {
+  if (i == 0 || i > s_alarm_count) {
+    out[0] = '\0';
+    return;
+  }
+  Alarm *a = &s_alarms[i - 1];
+  if (!a->enabled) {
+    out[0] = '\0';
+    return;
+  }
+  static const char *const type_letters[3] = { "R", "1", "T" };
+  snprintf(out, out_len, "%s", type_letters[a->alarm_type]);
 }
 
 static void list_update_text(void) {
   static char row_text[LIST_WINDOW_ROWS][48];
+  static char type_text[LIST_WINDOW_ROWS][4];
 
   for (int row = 0; row < LIST_WINDOW_ROWS; row++) {
     int i = s_list_scroll + row;
@@ -997,6 +1125,18 @@ static void list_update_text(void) {
     text_layer_set_text_color(s_list_row_layers[row], active
         ? PBL_IF_COLOR_ELSE(GColorRed, GColorBlack)
         : GColorFromRGB(64, 64, 64));
+
+    // "+ Add alarm" has no type/day columns to share the row with - widen
+    // its text layer to the full row width instead of leaving it clipped to
+    // the narrow time column
+    GRect frame = layer_get_frame(text_layer_get_layer(s_list_row_layers[row]));
+    frame.size.w = (i == 0) ? s_list_row_w : s_list_time_w;
+    layer_set_frame(text_layer_get_layer(s_list_row_layers[row]), frame);
+
+    list_type_text(i, type_text[row], sizeof(type_text[row]));
+    text_layer_set_text(s_list_type_layers[row], type_text[row]);
+
+    layer_mark_dirty(s_list_day_layers[row]);
   }
 }
 
@@ -1010,37 +1150,58 @@ static void list_scroll_to_cursor(void) {
   }
 }
 
+// creates a new default alarm right under the "+ Add alarm" row (index 0)
+// and jumps straight into editing it
+static void add_new_alarm(void) {
+  if (s_alarm_count >= MAX_ALARMS) return;  // reached the ceiling, nothing to do
+  for (int i = s_alarm_count; i > 0; i--) {
+    s_alarms[i] = s_alarms[i - 1];
+  }
+  time_t now = time(NULL);
+  struct tm *now_tm = localtime(&now);
+  s_alarms[0] = (Alarm){
+    .enabled = true, .hour = now_tm->tm_hour, .minute = now_tm->tm_min,
+    .days_mask = (uint8_t)(1 << now_tm->tm_wday),  // default: today, so it fires by itself once as expected
+    .wakeup_id = -1,
+    .target_bpm = DEFAULT_TARGET_BPM, .sustain_secs = DEFAULT_SUSTAIN_SECS, .grace_secs = DEFAULT_GRACE_SECS,
+    .alarm_type = AlarmOnce,
+  };
+  s_alarm_count++;
+  save_alarms();
+  // every existing alarm just shifted down one slot. wakeup_schedule() bakes
+  // the array index in as its "reason", so a previously-scheduled wakeup now
+  // has a stale index baked into it (it would wake into the WRONG alarm's
+  // slot) - re-schedule everything so each one's reason matches its new spot
+  for (int i = 0; i < s_alarm_count; i++) {
+    schedule_alarm_index(i);
+  }
+  enter_edit_screen(0);
+}
+
 static void list_up_click_handler(ClickRecognizerRef recognizer, void *context) {
-  s_list_cursor = (s_list_cursor + MAX_ALARMS) % LIST_TOTAL_ROWS;
+  s_list_cursor = (s_list_cursor + s_alarm_count) % (s_alarm_count + 1);
   list_scroll_to_cursor();
   list_update_text();
 }
 
 static void list_down_click_handler(ClickRecognizerRef recognizer, void *context) {
-  s_list_cursor = (s_list_cursor + 1) % LIST_TOTAL_ROWS;
+  s_list_cursor = (s_list_cursor + 1) % (s_alarm_count + 1);
   list_scroll_to_cursor();
   list_update_text();
 }
 
 static void list_select_click_handler(ClickRecognizerRef recognizer, void *context) {
   if (s_list_cursor == 0) {
-    enter_settings_screen();
+    add_new_alarm();
   } else {
     enter_edit_screen(s_list_cursor - 1);
   }
 }
 
-static void list_select_long_click_handler(ClickRecognizerRef recognizer, void *context) {
-  // long-press SELECT: jump straight into alarm mode now, for testing without waiting
-  s_active_alarm_index = -1;
-  enter_alarm_mode();
-}
-
 static void list_click_config_provider(void *context) {
-  window_single_click_subscribe(BUTTON_ID_UP, list_up_click_handler);
-  window_single_click_subscribe(BUTTON_ID_DOWN, list_down_click_handler);
+  window_single_repeating_click_subscribe(BUTTON_ID_UP, 150, list_up_click_handler);
+  window_single_repeating_click_subscribe(BUTTON_ID_DOWN, 150, list_down_click_handler);
   window_single_click_subscribe(BUTTON_ID_SELECT, list_select_click_handler);
-  window_long_click_subscribe(BUTTON_ID_SELECT, 700, list_select_long_click_handler, NULL);
 }
 
 static void list_window_load(Window *window) {
@@ -1058,12 +1219,39 @@ static void list_window_load(Window *window) {
   layer_add_child(window_layer, text_layer_get_layer(s_list_title_layer));
   list_update_title();
 
+  int16_t row_w = bounds.size.w - 12;
+  int16_t time_w = row_w * 8 / 20;   // ~40%: plenty for unprefixed "HH:MM"
+  int16_t type_w = row_w * 3 / 20;   // ~15%: just enough for one GOTHIC_24 glyph - do NOT shrink
+                                      // day_w below this to make more room here, the day grid
+                                      // visibly breaks (mangled/overlapping letters) once its
+                                      // per-letter pitch drops much below ~60px total width
+  int16_t day_w = row_w - time_w - type_w;  // ~45%: keep this at its known-good width
+  s_list_row_w = row_w;
+  s_list_time_w = time_w;
   for (int i = 0; i < LIST_WINDOW_ROWS; i++) {
-    s_list_row_layers[i] = text_layer_create(
-        GRect(6, h * (16 + i * 16) / 100, bounds.size.w - 12, h * 16 / 100));
+    int16_t row_y = h * (16 + i * 16) / 100;
+    int16_t row_h = h * 16 / 100;
+
+    s_list_row_layers[i] = text_layer_create(GRect(6, row_y, time_w, row_h));
     text_layer_set_background_color(s_list_row_layers[i], GColorClear);
     text_layer_set_text_alignment(s_list_row_layers[i], GTextAlignmentLeft);
     layer_add_child(window_layer, text_layer_get_layer(s_list_row_layers[i]));
+
+    // same font size as the day grid (just not bold) so the glyph itself
+    // reads clearly, but its own isolated column/layer keeps it visually a
+    // distinct piece of info rather than an 8th day
+    s_list_type_layers[i] = text_layer_create(GRect(6 + time_w, row_y, type_w, row_h));
+    text_layer_set_background_color(s_list_type_layers[i], GColorClear);
+    text_layer_set_text_color(s_list_type_layers[i], GColorFromRGB(64, 64, 64));
+    text_layer_set_font(s_list_type_layers[i], fonts_get_system_font(FONT_KEY_GOTHIC_24));
+    text_layer_set_text_alignment(s_list_type_layers[i], GTextAlignmentCenter);
+    layer_add_child(window_layer, text_layer_get_layer(s_list_type_layers[i]));
+
+    s_list_day_layers[i] = layer_create_with_data(
+        GRect(6 + time_w + type_w, row_y, day_w, row_h), sizeof(int));
+    *(int *)layer_get_data(s_list_day_layers[i]) = i;
+    layer_set_update_proc(s_list_day_layers[i], list_day_grid_draw_proc);
+    layer_add_child(window_layer, s_list_day_layers[i]);
   }
 
   s_list_hint_layer = text_layer_create(GRect(0, h * 72 / 100, bounds.size.w, h * 28 / 100));
@@ -1071,7 +1259,7 @@ static void list_window_load(Window *window) {
   text_layer_set_text_color(s_list_hint_layer, GColorFromRGB(64, 64, 64));
   text_layer_set_font(s_list_hint_layer, fonts_get_system_font(FONT_KEY_GOTHIC_14));
   text_layer_set_text_alignment(s_list_hint_layer, GTextAlignmentCenter);
-  text_layer_set_text(s_list_hint_layer, "UP/DOWN: move cursor\nSELECT: edit\nhold SELECT: test now");
+  text_layer_set_text(s_list_hint_layer, "UP/DOWN: move cursor\nSELECT: open");
   layer_add_child(window_layer, text_layer_get_layer(s_list_hint_layer));
 
   list_update_text();
@@ -1081,6 +1269,8 @@ static void list_window_unload(Window *window) {
   text_layer_destroy(s_list_title_layer);
   for (int i = 0; i < LIST_WINDOW_ROWS; i++) {
     text_layer_destroy(s_list_row_layers[i]);
+    text_layer_destroy(s_list_type_layers[i]);
+    layer_destroy(s_list_day_layers[i]);
   }
   text_layer_destroy(s_list_hint_layer);
 }
@@ -1089,11 +1279,18 @@ static void list_window_appear(Window *window) {
   // refresh immediately when returning from the edit/settings screens,
   // rather than waiting for the next UP/DOWN press
   list_update_title();
+  // the alarm count may have shrunk (an alarm was just deleted): keep the
+  // cursor and scroll window in bounds
+  if (s_list_cursor > s_alarm_count) {
+    s_list_cursor = s_alarm_count;
+  }
+  list_scroll_to_cursor();
   list_update_text();
 }
 
 static void wakeup_handler(WakeupId id, int32_t reason) {
   s_active_alarm_index = (int)reason;
+  s_alarm_is_test = false;
   enter_alarm_mode();
 }
 
@@ -1119,8 +1316,17 @@ static void init(void) {
     int32_t reason = 0;
     if (wakeup_get_launch_event(&id, &reason)) {
       s_active_alarm_index = (int)reason;
+      s_alarm_is_test = false;
       enter_alarm_mode();
     }
+  } else if (persist_exists(PKEY_SESSION_ACTIVE) && persist_read_int(PKEY_SESSION_ACTIVE)) {
+    // an alarm session was in progress when the app last quit (e.g. via the
+    // system's long-BACK quit gesture, which no app can block) - resume
+    // straight back into the locked alarm screen instead of the main list
+    s_active_alarm_index = persist_exists(PKEY_SESSION_ALARM_IDX)
+      ? persist_read_int(PKEY_SESSION_ALARM_IDX) : -1;
+    s_alarm_is_test = persist_exists(PKEY_SESSION_IS_TEST) && persist_read_int(PKEY_SESSION_IS_TEST);
+    enter_alarm_mode();
   }
 }
 
